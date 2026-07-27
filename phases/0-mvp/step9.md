@@ -1,0 +1,169 @@
+# Step 9: billing
+
+## 읽어야 할 파일
+
+- `/docs/PRD.md` — 요금제 표가 이 step의 사양이다
+- `/docs/ADR.md` — ADR-002(Polar), ADR-006(횟수 아닌 보관기간·기능), ADR-007(가리기)
+- `/docs/ARCHITECTURE.md` — "플랜 게이팅"
+- `src/lib/plan.ts` (step 3) — `canAccess`, `retentionCutoff`. 여기 로직을 복제하지 마라.
+- `src/lib/supabase/admin.ts` (step 3) — 웹훅은 service role로 쓴다
+- `src/components/PlanGate.tsx` (step 8)
+
+## 작업
+
+`@polar-sh/nextjs` 어댑터로 결제를 붙인다. 헬퍼는 세 개다: `Checkout`, `CustomerPortal`, `Webhooks`.
+
+**세 파일 모두 `route.ts`이므로 대응 `route.test.ts`를 먼저 만들어야 한다** (TDD Guard).
+
+### 1. `src/app/api/checkout/route.ts`
+
+어댑터가 만드는 핸들러를 **그대로 export 하지 마라.** 감싸서 세션 검증을 먼저 한다:
+
+```ts
+import { Checkout } from "@polar-sh/nextjs";
+
+const checkout = Checkout({
+  accessToken: process.env.POLAR_ACCESS_TOKEN!,
+  successUrl: `${process.env.NEXT_PUBLIC_SITE_URL}/dashboard?upgraded=1`,
+  server: process.env.POLAR_SERVER as "sandbox" | "production",
+});
+
+export async function GET(req: NextRequest) {
+  const user = await getSessionUser();                    // lib/supabase/server.ts
+  if (!user) return NextResponse.redirect(new URL("/auth/login", req.url));
+
+  const external = req.nextUrl.searchParams.get("customerExternalId");
+  if (external !== user.id) {
+    return NextResponse.json({ error: "잘못된 요청입니다." }, { status: 403 });
+  }
+  return checkout(req);
+}
+```
+
+**`customerExternalId`를 클라이언트가 정하게 두지 마라 (CRITICAL, ADR-012).** 이 값은 쿼리 파라미터라 사용자가 바꿀 수 있고, 웹훅은 이 값으로 어느 계정을 업그레이드할지 결정한다. 남의 user id를 넣으면 **내 Polar 고객이 남의 계정에 연결**되고, 이후 내 구독이 해지될 때 그 사람이 강등된다. 고객 포털도 엉뚱한 계정에 물린다.
+
+세션 id와 대조해 다르면 403으로 막는 것이 최소 조치다. 더 확실하게 하려면 파라미터를 아예 무시하고 서버에서 주입해도 된다.
+
+### 2. `src/app/api/portal/route.ts`
+
+```ts
+export const GET = CustomerPortal({
+  accessToken: process.env.POLAR_ACCESS_TOKEN!,
+  getCustomerId: async (req) => { /* 세션에서 user id → external id */ },
+  server: ...,
+});
+```
+
+미인증이면 `/auth/login`으로 리다이렉트한다.
+
+### 3. `src/app/api/webhook/polar/route.ts`
+
+```ts
+export const POST = Webhooks({
+  webhookSecret: process.env.POLAR_WEBHOOK_SECRET!,
+  onSubscriptionActive: async (payload) => { /* → pro */ },
+  onSubscriptionRevoked: async (payload) => { /* → free */ },
+  onSubscriptionCanceled: async (payload) => { /* 기간 만료까지는 pro 유지 */ },
+  onSubscriptionUncanceled: async (payload) => { /* 해지 취소 → pro 유지 */ },
+  onSubscriptionUpdated: async (payload) => { /* 상태·기간 동기화 */ },
+});
+```
+
+어댑터는 26개 이벤트 핸들러를 제공한다. 위 다섯 개만 쓴다. `onSubscriptionUncanceled`를 빠뜨리지 마라 — 해지를 눌렀다가 취소하는 흐름이 실제로 존재하고, 이 이벤트를 안 받으면 상태가 `canceled`에 머문다.
+
+동기화 로직은 `src/lib/billing.ts`에 두고 (`billing.test.ts` 먼저) 라우트는 호출만 한다.
+
+```ts
+export async function syncSubscription(args: {
+  db: SupabaseClient;        // service role 클라이언트를 주입받는다
+  externalId: string;        // = supabase user id
+  polarSubscriptionId: string;
+  status: SubscriptionRecord["status"];
+  currentPeriodEnd: string | null;
+}): Promise<void>;
+```
+
+- **오래된 이벤트를 먼저 걸러낸다.** 저장된 행의 `current_period_end`(또는 페이로드의 `modified_at`)보다 오래된 이벤트가 들어오면 **아무것도 하지 않고 200을 반환한다.**
+  웹훅은 순서를 보장하지 않고 재시도까지 있다. 무조건 UPSERT 하면 늦게 도착한 옛 이벤트가 최신 상태를 되돌린다 — 해지 취소 직후 도착한 늦은 `canceled`가 다시 해지 상태로 만드는 식이다. 멱등성만으로는 이 문제가 풀리지 않는다.
+- `subscriptions` UPSERT (`onConflict: "user_id"`)
+- `profiles.plan`을 갱신: `status`가 `active`이거나, `canceled`·`past_due`인데 `currentPeriodEnd`가 미래면 `"pro"`. 그 외 `"free"`.
+- **해지 즉시 강등하지 마라.** 이미 결제한 기간은 사용할 수 있어야 한다.
+- **`past_due`도 즉시 강등하지 마라**(DE-08). 카드 한도 초과나 만료는 흔하고 대개 며칠 안에 해결된다. `currentPeriodEnd`까지를 유예로 삼아 Pro를 유지하고, 대시보드에 배너를 띄운다:
+  `"결제가 처리되지 않았습니다. 2026-08-05까지 Pro 기능을 계속 쓸 수 있습니다."`
+  유예가 끝나면 `revoked` 또는 기간 만료로 자연히 `free`가 된다.
+- 웹훅은 **멱등**이어야 한다. 같은 이벤트가 두 번 와도 결과가 같아야 한다 — UPSERT로 구현하고 카운터를 증가시키는 식의 처리를 하지 마라.
+- `externalId`로 프로필을 못 찾으면 조용히 무시하고 200을 반환한다. 5xx를 반환하면 Polar가 계속 재시도한다.
+
+### 4. 업그레이드 진입점
+
+- `src/components/UpgradeButton.tsx` (테스트 먼저) — `/api/checkout?products=...&customerExternalId=...`로 이동
+- `PlanGate`의 잠금 카드와 헤더의 Free 배지에서 이 버튼을 쓴다
+- 헤더에 Pro 사용자용 "구독 관리"(→ `/api/portal`) 링크
+
+### 5. `src/app/api/me/plan/route.ts` (**`route.test.ts` 먼저**)
+
+`GET` — 현재 세션의 `{ plan, status, currentPeriodEnd }`를 반환한다.
+
+step 8의 결제 확인 대기 화면이 이걸 폴링한다(DE-07). **Polar가 `successUrl`로 리다이렉트하는 시점과 웹훅이 도착하는 시점은 순서가 보장되지 않는다** — 방금 결제한 사용자가 잠긴 화면을 보는 구간이 실제로 존재한다. `successUrl`에 checkout id를 실어 검증하는 방법은 `@polar-sh/nextjs` 문서에 명시돼 있지 않으므로 그 방식에 의존하지 마라. 이 엔드포인트를 짧게 폴링하는 쪽이 확실하다.
+
+캐시하지 마라 (`export const dynamic = "force-dynamic"`).
+
+### 6. 보관 기간 만료 처리
+
+**없다.** ADR-007에 따라 데이터를 지우지 않는다. `applyRetention`이 조회 시점에 가릴 뿐이므로, 강등되어도 삭제 작업이 필요 없고 업그레이드하면 즉시 전부 보인다. **삭제 크론이나 배치를 만들지 마라.**
+
+### 테스트에 반드시 포함할 케이스
+
+- `syncSubscription`: `active` → `plan: "pro"`
+- `canceled` + `currentPeriodEnd` 미래 → `"pro"` 유지
+- `canceled` + `currentPeriodEnd` 과거 → `"free"`
+- **`past_due` + `currentPeriodEnd` 미래 → `"pro"` 유지** (유예)
+- **`past_due` + `currentPeriodEnd` 과거 → `"free"`**
+- **`canceled` 뒤에 `uncanceled`가 오면 `"pro"`로 되돌아오는지**
+- `revoked` → `"free"`
+- 같은 페이로드 2회 처리 → 결과 동일 (멱등성)
+- **오래된 이벤트가 뒤늦게 도착 → 최신 상태를 되돌리지 않는지** (순서 보장 없음)
+- 존재하지 않는 `externalId` → 예외 없이 종료
+- **`/api/checkout`에 세션과 다른 `customerExternalId`를 넣으면 403인지**
+- **미인증 상태로 `/api/checkout` 호출 시 로그인으로 보내는지**
+- 웹훅 라우트: 서명이 틀린 요청이 거부되는지 (어댑터가 처리하지만 라우트가 시크릿을 넘기는지 확인)
+
+## Acceptance Criteria
+
+```bash
+npm run lint
+npm run build
+npm run test
+```
+
+## 검증 절차
+
+1. 위 AC 커맨드를 실행한다.
+2. 아키텍처 체크리스트:
+   - 네 `route.ts` 각각에 `route.test.ts`가 있는가? (checkout · portal · webhook · me/plan)
+   - `past_due`에서 즉시 강등하지 않는가?
+   - `onSubscriptionUncanceled`를 처리하는가?
+   - `syncSubscription`이 `db`를 주입받는가?
+   - `plan.ts`의 판정 로직을 복제하지 않았는가?
+   - 데이터 삭제 코드가 없는가? (ADR-007)
+   - 업로드/분석 횟수를 제한하는 코드가 없는가? (ADR-006)
+   - 웹훅 핸들러가 실패 시 5xx를 던지지 않는가?
+3. 결과에 따라 `phases/0-mvp/index.json`의 step 9를 업데이트한다:
+   - 성공 → `"status": "completed"`, `"summary"`에 세 라우트 경로와 `syncSubscription` 시그니처 요약
+   - 3회 시도 후 실패 → `"status": "error"` + `"error_message"`
+   - Polar 상품·웹훅 생성처럼 실제 자격증명이 필요한 검증은 **레포 루트의 `DEPLOY_CHECKLIST.md`**에 `- [ ] (미검증)` 항목으로 append 하고(파일이 없으면 만든다), 코드 작성과 모킹 테스트가 통과하면 step은 `"completed"`로 처리한다. 외부 검증 미실행만으로 `"blocked"` 처리하지 마라.
+     `docs/` 아래에 두지 마라 — `execute.py:184`가 `docs/*.md`를 12개 step 프롬프트마다 주입한다. 검증 항목이 쌓이는 파일이라 주입 대상이 되면 안 된다.
+
+## 금지사항
+
+- 분석 횟수로 플랜을 나누지 마라. 이유: 명세서는 월 1회 나온다(ADR-006).
+- 해지 즉시 Pro 기능을 끊지 마라. 이유: 이미 결제한 기간의 권리다.
+- `past_due`가 왔다고 즉시 강등하지 마라. 이유: 카드 만료·한도 초과는 흔하고 대개 며칠 안에 해결된다. 결제 한 번 실패했다고 기능을 끊으면 복구할 사용자까지 잃는다.
+- `successUrl`에 checkout id를 실어 결제를 검증하는 방식에 의존하지 마라. 이유: `@polar-sh/nextjs` 문서에 해당 치환 파라미터가 명시돼 있지 않다. `/api/me/plan` 폴링을 쓴다.
+- 보관 기간이 지난 데이터를 삭제하는 크론·배치를 만들지 마라. 이유: ADR-007. 조회에서 가리기만 한다.
+- 웹훅에서 실패 시 5xx를 반환하지 마라. 이유: Polar가 무한 재시도한다. 처리 불가는 로그를 남기고 200을 반환한다.
+- 웹훅에서 anon 클라이언트를 쓰지 마라. 이유: RLS 때문에 다른 사용자 행을 쓸 수 없다. service role 클라이언트가 필요하다.
+- **`Checkout(...)`이 만든 핸들러를 그대로 `export const GET`으로 내보내지 마라.** 이유: `customerExternalId`가 검증 없이 통과해 남의 계정에 구독이 붙는다(ADR-012).
+- 웹훅 이벤트가 순서대로 온다고 가정하지 마라. 이유: 재시도와 병렬 전송 때문에 옛 이벤트가 나중에 도착한다. 시각을 비교해 오래된 것은 버린다.
+- `POLAR_ACCESS_TOKEN` 등에 `NEXT_PUBLIC_` 접두사를 붙이지 마라. 이유: 브라우저에 노출된다.
+- 기존 테스트를 깨뜨리지 마라.
