@@ -23,9 +23,20 @@ PRD의 분석 4종을 대시보드에 렌더한다. 차트 라이브러리는 `r
 2. `transactions` 조회 → `applyRetention(txns, plan)` 적용
 3. **거래가 하나도 없으면 빈 상태를 렌더하고 끝낸다.** 업로드 영역 + `/help/csv` 도움말 링크 + 샘플 CSV 내려받기. 빈 대시보드에 업로드 박스만 두면 CSV를 어디서 받는지 모르는 사용자가 여기서 멈춘다(DE-03).
 4. `categoryBreakdown` / `periodTrend` / `periodOverPeriodDelta` 계산. 히어로 기준 기간은 **가장 최근 `statements.period_end`가 속한 기간**이다.
-5. **`detectRecurring` / `detectAnomalies`는 plan과 무관하게 실행한다.** Free에도 건수·총액을 보여줘야 하기 때문이다(ADR-010). 전부 코드 계산이라 비용이 없다. 잠그는 것은 목록이지 계산이 아니다.
-6. plan이 `pro`일 때만 `insights` 테이블 캐시를 확인하고, 없으면 `generateInsights`를 호출해 저장한다. **이 호출이 실패해도 나머지 화면은 정상 렌더한다** — LLM 하나 때문에 대시보드 전체가 죽으면 안 된다.
+5. **`detectRecurring` / `detectAnomalies`는 plan과 무관하게, 보관 기간 필터를 거치지 않은 전체 거래로 실행한다.** Free에도 건수·총액을 보여줘야 하고(ADR-010), 반복 결제는 3회 누적이 조건이라 90일 컷오프를 먼저 걸면 거의 잡히지 않는다. 전부 코드 계산이라 비용이 없다. 잠그는 것은 목록이지 계산이 아니다.
+6. `insights` 테이블에서 **캐시를 읽기만 한다.** **여기서 `generateInsights`를 호출하지 마라** — Server Component 렌더 안에서 LLM을 부르면 페이지 응답이 20~30초 막힌다(ADR-011). 생성은 step 7의 2단계가 담당한다.
+   - 캐시가 없으면 `"인사이트를 준비하고 있습니다."` + 생성 버튼(= 재분류 엔드포인트 호출)을 렌더한다.
 7. 결과를 컴포넌트에 props로 내린다
+
+**조회 쿼리 자체에 보관 기간 필터를 건다.** 전부 가져와서 TS에서 거르지 마라 — Free 사용자에게 몇 년치 행을 Postgres에서 끌어온 뒤 버리는 셈이다.
+
+```ts
+const cutoff = retentionCutoff(plan);
+let q = db.from("transactions").select("*").order("txn_date", { ascending: false });
+if (cutoff) q = q.gte("txn_date", toDateString(cutoff));
+```
+
+`applyRetention`(step 5)은 순수 함수 테스트용이고, 실제 조회 경로에서는 이 SQL 필터가 사용된다. 단, 5번의 탐지 함수에 넘길 거래는 **필터 없이** 따로 조회한다.
 
 `useEffect` + `fetch`로 초기 데이터를 받지 마라 (CLAUDE.md 규칙).
 
@@ -64,7 +75,8 @@ PRD의 분석 4종을 대시보드에 렌더한다. 차트 라이브러리는 `r
 
 **6. `src/components/dashboard/InsightsPanel.tsx`** (Pro 전용)
 `summary` 본문 + `savingSuggestions` 카드 목록(절감액 내림차순, `formatKRW` 적용).
-LLM 결과임을 알리는 짧은 각주를 둔다. **"Powered by AI" 배지를 만들지 마라** (UI_GUIDE 안티패턴).
+LLM 결과임을 알리는 짧은 각주와 **생성 시각**을 둔다. **"Powered by AI" 배지를 만들지 마라** (UI_GUIDE 안티패턴).
+props로 이미 만들어진 `Insight`를 받는다. **이 컴포넌트가 LLM을 부르지 않는다.**
 
 **7. `src/components/dashboard/UploadDropzone.tsx`** (Client Component)
 드래그앤드롭 + 파일 선택. **호출은 두 번이다**(ADR-008): `POST /api/statements` → 응답을 받아 화면을 갱신한 뒤 → `POST /api/statements/[id]/classify`.
@@ -132,6 +144,8 @@ npm run test
    - **`USER_JOURNEY.md` 11장 매트릭스의 8개 화면 × 4개 상태가 전부 처리되었는가?**
    - **히어로 숫자가 "이번 달"이 아니라 최근 명세서 기간 기준인가?**
    - **구독·이상 거래 요약 수치가 Free에도 표시되는가?** (계산까지 잠그면 안 된다)
+   - **`page.tsx`와 컴포넌트 어디에도 `generateInsights` 호출이 없는가?** (`grep -rn "generateInsights" src/app src/components` → 0건이어야 한다)
+   - **보관 기간 필터가 SQL 쿼리(`.gte("txn_date", …)`)에 걸려 있는가?** (전량 조회 후 TS 필터 금지)
    - 미분류 배너와 다시 분류하기 버튼이 있는가?
    - 초기 데이터를 `useEffect`+`fetch`로 받지 않는가?
    - UI 문자열이 전부 한국어인가?
@@ -148,6 +162,8 @@ npm run test
 - Free 사용자에게 `detectRecurring`·`detectAnomalies` **계산 자체를 건너뛰지 마라.** 이유: 건수·총액을 보여줘야 하고, 그게 유일한 전환 근거다(ADR-010).
 - 성공 경로만 렌더하지 마라. 이유: 빈 상태·부분 상태·실패 상태가 실제 사용에서 훨씬 자주 나온다. 매트릭스의 모든 칸이 이 step의 요구사항이다.
 - 결제 반영이 늦은 것을 결제 실패로 표시하지 마라. 이유: 돈은 이미 나갔고, 사용자는 사기당했다고 느낀다.
+- **Server Component 렌더 안에서 LLM을 호출하지 마라.** 이유: 페이지 응답이 20~30초 막힌다. 대시보드는 `insights` 캐시를 읽기만 하고, 생성은 step 7의 2단계가 한다(ADR-011).
+- 거래를 전량 조회한 뒤 TS에서 보관 기간을 거르지 마라. 이유: Free 사용자에게 몇 년치 행을 끌어온 뒤 버리는 셈이다. 필터는 쿼리에 건다.
 - `UI_GUIDE.md` 안티패턴 표의 항목을 쓰지 마라 (glass morphism, 그라데이션 텍스트, "Powered by AI" 배지, 글로우 애니메이션, 보라색 브랜딩, gradient orb).
 - 모든 데이터 포인트에 숫자 라벨을 찍지 마라. 이유: 차트가 표가 되어버린다. 표가 필요하면 표 보기 토글을 쓴다.
 - 기존 테스트를 깨뜨리지 마라.

@@ -52,19 +52,26 @@ export async function ingestStatement(args: {
 ```ts
 export async function classifyStatement(args: {
   userId: string;
-  statementId: string;
+  statementId: string;          // 소유권 확인과 인사이트 캐시 키에만 쓴다
   db: SupabaseClient;
   classify?: typeof classifyMerchants;   // 테스트에서 갈아끼운다
-}): Promise<{ classifiedCount: number; recurringCount: number }>;
+  makeInsights?: typeof generateInsights;
+}): Promise<{ classifiedCount: number; recurringCount: number; insightsGenerated: boolean }>;
 ```
+
+**이 함수는 명세서 단위가 아니라 사용자 단위로 동작한다.** 미분류 거래는 여러 명세서에 걸쳐 있을 수 있고, 반복 결제 탐지는 누적 전체를 봐야 한다. `statementId`는 소유권 확인과 인사이트 캐시 키에만 쓴다. 이 점을 함수 주석에 적어라 — 이름만 보면 명세서 하나만 처리하는 것처럼 읽힌다.
 
 순서:
 1. 이 사용자의 거래 중 **`category`가 null인 것의 유니크 `merchant` 목록**을 조회
 2. 그중 `merchant_categories`에 없는 것만 `classifyMerchants()`에 넘긴다. **목록이 비면 LLM을 호출하지 마라.**
 3. 결과를 `merchant_categories`에 UPSERT (`onConflict: "user_id,merchant"`, `source: "llm"`) — **`source: "user"`인 행은 덮어쓰지 마라.**
 4. 맵을 근거로 `transactions.category`를 UPDATE. 여기서도 `category_source: "user"`인 거래는 건드리지 마라.
-5. 이 사용자의 전체 거래로 `detectRecurring()` → `recurring_charges` UPSERT (`onConflict: "user_id,merchant"`)
-   - 반복 결제 탐지는 **명세서 한 건이 아니라 누적 전체**를 봐야 의미가 있다.
+5. 이 사용자의 **전체 거래**(보관 기간 필터 없이)로 `detectRecurring()` → `recurring_charges` UPSERT (`onConflict: "user_id,merchant"`)
+   - 반복 결제 탐지는 명세서 한 건이 아니라 누적 전체를 봐야 의미가 있고, 3회 누적이 조건이라 90일 컷오프를 먼저 걸면 거의 잡히지 않는다(step 5 참조).
+6. **plan이 `pro`이고 `insights`에 해당 `cache_key`가 없으면 `generateInsights()`를 호출해 저장한다.**
+   - 캐시 키는 step 6의 `insightCacheKey(statementId, txnCount)`. `insights` 테이블에 `onConflict: "user_id,cache_key"`로 UPSERT.
+   - **인사이트 생성은 여기가 유일한 자리다.** 대시보드 렌더에서 LLM을 부르지 마라 — 페이지 응답이 20~30초 막힌다. 업로드를 2단계로 나눈 것과 같은 이유다(ADR-008, ADR-011).
+   - 이 호출이 실패해도 1~5단계 결과는 유지하고 `insightsGenerated: false`로 반환한다.
 
 **멱등이어야 한다.** 같은 명세서에 두 번 호출해도 결과가 같아야 사용자가 "다시 분류하기"를 눌러도 안전하다.
 
@@ -115,6 +122,9 @@ export async function classifyStatement(args: {
 - 미분류 가맹점이 0개면 `classifyMerchants`가 호출되지 않는지
 - **`classifyStatement`를 두 번 호출해도 결과가 같은지** (멱등성)
 - **분류가 실패해도 이미 저장된 거래가 남아 있는지** (롤백하지 않음)
+- **인사이트 캐시가 있으면 `generateInsights`가 호출되지 않는지**
+- **인사이트 생성이 실패해도 분류·반복결제 결과가 유지되고 `insightsGenerated: false`가 반환되는지**
+- **plan이 `free`면 `generateInsights`가 호출되지 않는지**
 - **`applyToMerchant: true`로 수정하면 같은 가맹점 전체가 바뀌고 `merchant_categories`에 `source: "user"`로 남는지**
 - 파서가 던진 한국어 에러가 400 응답 본문에 그대로 실리는지
 - 예상치 못한 예외의 원문이 응답에 **노출되지 않는지**

@@ -68,10 +68,20 @@ export function parseStatementCsv(buffer: ArrayBuffer, filename: string): ParseR
 `src/lib/dedupe.ts`에 거래 지문을 만든다 (`dedupe.test.ts` 먼저).
 
 ```ts
-export function transactionFingerprint(t: Pick<ParsedTransaction, "txnDate" | "amount" | "description">): string;
+export function transactionFingerprint(
+  t: Pick<ParsedTransaction, "txnDate" | "amount" | "description">,
+  occurrence: number,          // 이 파일 안에서 동일 조합이 몇 번째로 나왔는지 (0부터)
+): string;
+
+/** 파싱 결과 배열에 occurrence 번호를 매겨 지문을 붙인다 */
+export function withFingerprints(txns: ParsedTransaction[]): (ParsedTransaction & { fingerprint: string })[];
 ```
 
-`txnDate|amount|description`을 정규화해 SHA-256 hex로 반환한다. Node 내장 `crypto`를 쓴다.
+`txnDate|amount|description|occurrence`를 정규화해 SHA-256 hex로 반환한다. Node 내장 `crypto`를 쓴다.
+
+**`occurrence`를 빼지 마라.** 같은 날 같은 가게에서 같은 금액을 두 번 결제하는 일은 흔하다(커피 두 잔, 왕복 교통비). `occurrence` 없이 지문을 만들면 두 번째 거래가 중복으로 간주돼 **조용히 사라진다.** 게다가 step 5의 `duplicate_suspect` 이상 탐지는 정확히 "같은 가맹점·같은 금액이 24시간 이내 2건 이상"을 찾는데, 그 데이터를 파서가 이미 지워버린 뒤라 영원히 탐지되지 않는다.
+
+`occurrence`를 넣어도 **같은 파일을 다시 올리면 같은 지문 집합이 나오므로** 재업로드 중복 방지는 그대로 동작한다. 파일 안에서 등장 순서대로 0, 1, 2… 를 매기면 된다.
 
 ### 테스트에 반드시 포함할 케이스
 
@@ -81,7 +91,8 @@ export function transactionFingerprint(t: Pick<ParsedTransaction, "txnDate" | "a
 - 괄호 음수, 통화기호, 천단위 콤마
 - **마스킹**: 카드번호가 `description`과 `raw` 양쪽에서 모두 마스킹되는지 단언
 - 매핑 실패 시 한국어 에러 메시지
-- 같은 거래 2건의 지문이 동일한지
+- **같은 파일을 두 번 파싱하면 지문 집합이 동일한지** (재업로드 중복 방지가 동작해야 한다)
+- **같은 날·같은 가맹점·같은 금액 거래 2건이 서로 다른 지문을 갖는지** (정상 중복이 살아남아야 한다)
 
 ## Acceptance Criteria
 

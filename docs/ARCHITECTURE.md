@@ -25,11 +25,19 @@ supabase/migrations/        # SQL 마이그레이션 (테이블 + RLS)
 | `transactions` | **개별 거래 원본** | `user_id`, `statement_id`, `txn_date`, `description`, `merchant`, `amount`, `category`, `category_source`, `raw` (jsonb 원본 행) |
 | `merchant_categories` | 사용자별 가맹점→카테고리 맵 | `user_id`, `merchant`, `category`, `source`(`llm`\|`user`), unique `(user_id, merchant)` |
 | `recurring_charges` | 탐지된 반복 결제 | `user_id`, `merchant`, `median_amount`, `interval_days`, `last_seen_at`, `status`(`active`\|`dormant`) |
-| `insights` | LLM 생성 요약/제안 | `user_id`, `statement_id`, `kind`, `payload`(jsonb), `model` |
+| `insights` | LLM 생성 요약/제안 | `user_id`, `statement_id`, `kind`, `payload`(jsonb), `model`, `cache_key`, unique `(user_id, cache_key)` |
 
 거래는 **원본 그대로 보관한다.** 명세서를 누적할수록 기간별 추이와 반복 결제 탐지가 정확해지기 때문이다. `transactions.raw`에 원본 CSV 행을 jsonb로 남겨 컬럼 매핑이 틀렸을 때 재처리할 수 있게 한다.
 
-중복 방지: `(user_id, txn_date, amount, description)` 해시를 유니크 키로 두어 같은 명세서를 두 번 올려도 거래가 중복되지 않게 한다.
+금액은 `numeric(14,0)` — **원 단위 정수**다. 원화에 소수점이 없고, 소수 자리를 두면 반올림 오차가 들어올 자리가 생긴다.
+
+중복 방지: `(txn_date, amount, description, occurrence)` 해시를 `fingerprint`로 두고 `unique (user_id, fingerprint)`를 건다. `occurrence`는 **한 파일 안에서 동일 조합이 몇 번째로 등장했는지**다. 이게 없으면 같은 날 같은 가게에서 같은 금액을 두 번 결제한 정상 거래가 중복으로 지워지고, 그 데이터를 근거로 하는 `duplicate_suspect` 이상 탐지가 영원히 발동하지 않는다.
+
+카테고리의 진실 위치가 둘로 보이지만 서로 다른 사실을 기록한다:
+- `merchant_categories.source` — 이 **가맹점**의 기본 카테고리를 누가 정했는가
+- `transactions.category_source` — 이 **거래 하나**를 사용자가 따로 지정했는가. `'user'`면 맵 갱신이 절대 덮어쓰지 않는다
+
+`transactions.category`는 맵에서 파생된 값을 물리적으로 들고 있는 캐시다. 집계 쿼리가 조인 없이 돌게 하기 위해서다.
 
 ## 분석 파이프라인 — 무엇을 코드로, 무엇을 LLM으로
 
@@ -37,14 +45,14 @@ supabase/migrations/        # SQL 마이그레이션 (테이블 + RLS)
 
 | 분석 | 담당 | 이유 |
 |------|------|------|
-| 기간별 지출 추이 | **코드** (SQL 집계) | 산술은 결정론적이어야 하고 검증 가능해야 한다 |
-| 카테고리별 합계 | **코드** (SQL 집계) | 위와 동일 |
+| 기간별 지출 추이 | **코드** (TS 순수 함수) | 산술은 결정론적이어야 하고 검증 가능해야 한다 |
+| 카테고리별 합계 | **코드** (TS 순수 함수) | 위와 동일 |
 | 가맹점 → 카테고리 분류 | **LLM** | `(주)우아한형제들` → 배달. 규칙으로는 못 잡는다 |
 | 반복 결제(구독) 탐지 | **코드** (규칙) | 동일 가맹점 + 금액 편차 ≤10% + 간격 25~35일 등. 규칙이 더 정확하고 공짜 |
 | 이상 거래 탐지 | **코드** (통계) | 카테고리별 중앙값 대비 이상치(MAD 기반) |
 | 요약 & 절약 인사이트 | **LLM** | 집계 결과를 **입력으로 받아** 한국어 서술 생성 |
 
-LLM 호출은 두 번뿐이다: ① 미분류 가맹점 목록 → 카테고리 배열, ② 집계 결과 요약본 → 인사이트. 거래 원문 전체를 프롬프트에 넣지 않는다.
+LLM 호출은 두 번뿐이고 **둘 다 업로드 2단계에서만 일어난다**(ADR-011): ① 미분류 가맹점 목록 → 카테고리 배열, ② 집계 결과 요약본 → 인사이트. 거래 원문 전체를 프롬프트에 넣지 않는다. 조회 경로(Server Component, 컴포넌트)에는 LLM 호출이 하나도 없어야 한다.
 
 ## 데이터 흐름
 
@@ -64,15 +72,21 @@ LLM 호출은 두 번뿐이다: ① 미분류 가맹점 목록 → 카테고리 
   → services/anthropic.classifyMerchants() ─ LLM 호출 ①
   → merchant_categories UPSERT + transactions.category UPDATE
   → lib/recurring: 누적 전체로 반복 결제 탐지 → recurring_charges UPSERT
-  → { classifiedCount } 응답
+  → plan이 pro이고 캐시가 없으면:
+      services/anthropic.generateInsights(집계결과) ─ LLM 호출 ②
+      → insights UPSERT (onConflict: user_id,cache_key)
+  → { classifiedCount, recurringCount, insightsGenerated } 응답
 
-[대시보드 조회]
+[대시보드 조회]  ── LLM을 부르지 않는다 (ADR-011)
 /dashboard (Server Component)
-  → lib/analytics: SQL 집계 (카테고리별 / 월별 / 이상치)
-  → plan이 pro면: services/anthropic.generateInsights(집계결과) ─ LLM 호출 ②
-     (insights 테이블에 캐시. 같은 statement에 대해 재호출하지 않는다)
+  → transactions 조회. 보관 기간 필터는 쿼리에 건다 (.gte("txn_date", cutoff))
+  → lib/analytics(TS 순수 함수)로 집계: 카테고리별 / 기간별 / 전월 대비
+  → 탐지(반복결제·이상거래)는 보관 기간 필터 없이 전체 이력으로 계산 (ADR-010 따름정리)
+  → insights 테이블에서 캐시를 읽기만 한다. 없으면 "준비 중" + 생성 버튼
   → 차트 + 카드 렌더
 ```
+
+집계는 **TS 순수 함수**가 한다(SQL 뷰나 RPC를 만들지 않는다). 조회한 거래 배열을 `src/lib/analytics/`에 넘기는 방식이라 테스트가 빠르고 결정론적이다. 보관 기간이 조회 범위를 제한하므로 메모리에 올라오는 행 수도 유계다. 이력이 커져 이 방식이 버거워지면 그때 SQL 집계로 옮긴다 — MVP 범위에서는 필요 없다.
 
 ## 플랜 게이팅
 

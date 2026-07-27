@@ -12,6 +12,8 @@
 
 `src/services/anthropic.ts`에 Claude API 래퍼를 만든다. LLM 호출은 **딱 두 개**다. `anthropic.test.ts`를 먼저 작성하라 (TDD Guard). 테스트는 SDK를 `vi.mock`으로 가짜 응답을 주고 검증한다 — 실제 API를 호출하지 마라.
 
+**이 테스트 파일에 `// @vitest-environment jsdom`을 붙이지 마라.** Anthropic SDK는 jsdom 환경을 지원하지 않는다고 공식 문서에 명시돼 있다. step 0이 기본 환경을 `node`로 잡아뒀으니 아무것도 붙이지 않으면 된다.
+
 ### 공통 규칙
 
 - 모델은 `claude-opus-5`. 다른 모델을 쓰지 마라.
@@ -28,7 +30,12 @@
   });
   res.parsed_output   // 타입이 붙은 결과
   ```
-  `zodOutputFormat`의 시그니처는 SDK 버전에 따라 인자가 하나이거나 `(schema, name)`이다. 타입 에러가 나면 `node_modules/@anthropic-ai/sdk`에서 실제 시그니처를 확인해 맞춰라.
+  `zodOutputFormat`은 **인자를 하나만** 받는다 (`@anthropic-ai/sdk/helpers/zod`에서 확인됨):
+  ```ts
+  declare function zodOutputFormat<T extends z.ZodType>(zodObject: T): AutoParseableOutputFormat<z.infer<T>>;
+  ```
+  이 헬퍼의 타입 정의는 `import * as z from 'zod/v4'`로 시작한다 — **zod 4.x가 필요하다.** step 0이 `zod@^4`를 설치했는지 먼저 확인하라. 3.x면 `zod/v4` 서브패스가 없어 컴파일되지 않는다.
+  그래도 타입 에러가 나면 `node_modules/@anthropic-ai/sdk/helpers/zod.d.mts`에서 실제 시그니처를 읽어 맞춰라. 최후 수단으로 zod 대신 raw JSON Schema를 `output_config.format`에 직접 넣을 수 있다.
 - `max_tokens`는 넉넉히 잡는다(16000). Claude Opus 5는 **thinking이 기본 활성**이고 `max_tokens`가 thinking + 응답을 함께 제한하므로, 작게 잡으면 응답이 중간에 잘린다.
 - `stop_reason === "refusal"`을 먼저 확인한 뒤 결과를 읽어라. 거절 시 한국어 에러를 throw 한다.
 - `temperature` / `top_p` / `top_k` / `budget_tokens`를 쓰지 마라 — Claude Opus 5에서 400 에러다. 깊이 조절은 `output_config.effort`로 한다.
@@ -75,7 +82,7 @@ export async function generateInsights(input: {
 export function insightCacheKey(statementId: string, txnCount: number): string;
 ```
 
-같은 명세서에 대해 거래 수가 변하지 않았으면 재호출하지 않는다. 실제 저장은 `insights` 테이블(step 7·8)에서 하고, 여기서는 키 생성만 한다.
+같은 명세서에 대해 거래 수가 변하지 않았으면 재호출하지 않는다. 여기서는 키 생성만 하고, 실제 저장은 **step 7의 2단계**가 `insights.cache_key`(unique `(user_id, cache_key)`)에 UPSERT 한다. **대시보드(step 8)는 이 캐시를 읽기만 하고 `generateInsights`를 부르지 않는다**(ADR-011).
 
 ### 테스트에 반드시 포함할 케이스
 

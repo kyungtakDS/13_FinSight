@@ -37,8 +37,13 @@
 
 의존성:
 
-- runtime: `next@^15`, `react@^19`, `react-dom@^19`, `@supabase/supabase-js`, `@supabase/ssr`, `@anthropic-ai/sdk`, `@polar-sh/nextjs`, `zod`, `papaparse`, `iconv-lite`, `recharts`
-- dev: `typescript`, `@types/node`, `@types/react`, `@types/react-dom`, `@types/papaparse`, `eslint`, `eslint-config-next`, `@eslint/eslintrc`, `tailwindcss@^4`, `@tailwindcss/postcss`, `postcss`, `vitest`, `@vitejs/plugin-react`, `jsdom`, `@testing-library/react`, `@testing-library/jest-dom`
+- runtime: `next@^15`, `react@^19`, `react-dom@^19`, `@supabase/supabase-js`, `@supabase/ssr`, `@anthropic-ai/sdk`, `@polar-sh/nextjs`, **`zod@^4`**, `papaparse`, `iconv-lite`, **`recharts@^3`**
+- dev: `typescript`, `@types/node`, `@types/react`, `@types/react-dom`, `@types/papaparse`, `eslint`, `eslint-config-next`, `@eslint/eslintrc`, `tailwindcss@^4`, `@tailwindcss/postcss`, `postcss`, `vitest`, `@vitejs/plugin-react`, `jsdom`, **`@testing-library/react@^16`**, `@testing-library/jest-dom`
+
+**버전을 낮추지 마라. 셋 다 이유가 있다:**
+- `zod@^4` — `@anthropic-ai/sdk/helpers/zod`의 타입 정의가 `import * as z from 'zod/v4'`로 시작한다. zod 3.x에는 그 서브패스가 없어 step 6의 구조화 출력이 컴파일되지 않는다.
+- `recharts@^3` — 2.x는 peerDependencies에 React 19가 없다. 3.x부터 `^19.0.0`이 들어간다.
+- `@testing-library/react@^16` — React 19 지원은 v16부터다.
 
 ### 2. 설정 파일
 
@@ -46,8 +51,18 @@
 - `next.config.ts`
 - `eslint.config.mjs` — `eslint-config-next` 기반 flat config
 - `postcss.config.mjs` — `@tailwindcss/postcss`
-- `vitest.config.ts` — `environment: "jsdom"`, `globals: true`, `setupFiles`, `@/*` alias 를 `tsconfig`와 동일하게 매핑. **`include` 패턴이 `src/**/*.test.{ts,tsx}`를 잡도록 하라.**
+- `vitest.config.ts` — **`environment: "node"` (기본값)**, `globals: true`, `setupFiles`, `@/*` alias 를 `tsconfig`와 동일하게 매핑. **`include` 패턴이 `src/**/*.test.{ts,tsx}`를 잡도록 하라.**
 - `vitest.setup.ts` — `@testing-library/jest-dom` import
+
+**기본 환경을 `jsdom`으로 잡지 마라.** Anthropic TypeScript SDK 공식 문서가 **jsdom 환경을 지원하지 않는다**고 명시한다. 전역을 jsdom으로 두면 step 6의 `anthropic.test.ts`가 미지원 환경에서 돌아 원인을 찾기 어려운 실패가 난다.
+
+대신 **컴포넌트 테스트 파일 최상단에만** 다음 한 줄을 붙인다:
+
+```ts
+// @vitest-environment jsdom
+```
+
+이 docblock 방식은 vitest 버전에 무관하게 동작한다(`environmentMatchGlobs`는 최신 vitest에서 deprecated). `src/lib/`·`src/services/`·`route.test.ts`는 전부 node 환경이 맞다 — DOM이 필요 없고, SDK와 Node 내장 `crypto`를 쓴다.
 
 ### 3. 최소 앱 셸
 
@@ -103,6 +118,8 @@ npm run test
    - `src/` 하위 구조가 `docs/ARCHITECTURE.md`의 디렉토리 구조를 따르는가?
    - `tsconfig.json`에 `strict: true`가 있는가?
    - `package.json`의 `test`가 `vitest run`인가? (watch 모드가 아닌가)
+   - `vitest.config.ts`의 기본 환경이 `node`인가? (jsdom 전역 금지)
+   - `zod`가 4.x, `recharts`가 3.x, `@testing-library/react`가 16.x로 설치됐는가? (`npm ls zod recharts @testing-library/react`)
 3. 결과에 따라 `phases/0-mvp/index.json`의 step 0을 업데이트한다:
    - 성공 → `"status": "completed"`, `"summary"`에 생성한 설정 파일과 `src/lib/format.ts` 시그니처를 한 줄 요약
    - 3회 시도 후 실패 → `"status": "error"`, `"error_message"`에 구체적 에러
@@ -115,3 +132,5 @@ npm run test
 - 실제 API 키를 `.env.example`이나 코드에 넣지 마라. 이유: 커밋에 시크릿이 남는다.
 - Supabase / Anthropic / Polar 연동 코드를 이 step에서 쓰지 마라. 이유: 각각 step 3, 6, 9의 범위다. 여기서는 의존성 설치까지만 한다.
 - 라이트 모드 스타일을 만들지 마라. 이유: 다크 고정이 설계 결정이다.
+- vitest 기본 환경을 `jsdom`으로 두지 마라. 이유: Anthropic SDK가 jsdom을 지원하지 않는다고 공식 문서에 명시돼 있다. step 6에서 원인 파악이 어려운 실패로 돌아온다.
+- `zod`를 3.x로 설치하지 마라. 이유: SDK의 zod 헬퍼가 `zod/v4` 서브패스를 import 한다.

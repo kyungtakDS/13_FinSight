@@ -21,12 +21,16 @@ SQL 마이그레이션과 Supabase 클라이언트 헬퍼를 만든다. **이 st
 - 모든 테이블에 `id uuid primary key default gen_random_uuid()`, `created_at timestamptz not null default now()`
 - `profiles.id`는 `references auth.users(id) on delete cascade`, `plan text not null default 'free' check (plan in ('free','pro'))`
 - 그 외 모든 테이블에 `user_id uuid not null references auth.users(id) on delete cascade`
-- `transactions`: `statement_id uuid not null references statements(id) on delete cascade`, `txn_date date not null`, `description text not null`, `merchant text not null`, `amount numeric(14,2) not null`, `category text`, `category_source text check (category_source in ('llm','user'))`, `raw jsonb not null`, `fingerprint text not null`
+- `transactions`: `statement_id uuid not null references statements(id) on delete cascade`, `txn_date date not null`, `description text not null`, `merchant text not null`, **`amount numeric(14,0) not null`**, `category text`, `category_source text check (category_source in ('llm','user'))`, `raw jsonb not null`, `fingerprint text not null`
+  - **소수점 자리를 두지 마라.** 원화에 소수점이 없고, `docs/ADR.md`와 step 5가 "정수 원 단위로 다룬다"를 전제한다. `numeric(14,2)`로 두면 반올림 오차가 들어올 자리를 만드는 셈이다.
+  - **`category_source`의 의미를 정확히 지켜라:** `'user'`는 *이 거래 하나*를 사용자가 직접 지정했다는 뜻이고, 가맹점 맵 갱신이 **절대 덮어써서는 안 되는 표시**다. `'llm'`은 맵에서 파생된 값이라 재분류로 갱신해도 된다. 맵(`merchant_categories.source`)은 가맹점의 기본값을, 이 컬럼은 거래 단위 예외를 기록한다 — 둘은 다른 사실이다.
 - **`unique (user_id, fingerprint)`** — 같은 명세서를 두 번 올려도 중복되지 않게
-- 인덱스: `transactions(user_id, txn_date desc)`, `transactions(user_id, category)`, `recurring_charges(user_id, status)`
+- 인덱스: `transactions(user_id, txn_date desc)`, `transactions(user_id, category)`, **`transactions(user_id, merchant)`**, `recurring_charges(user_id, status)`
+  - `(user_id, merchant)`는 step 7의 두 쿼리가 매번 쓴다 — 미분류 가맹점 스캔과 가맹점 단위 카테고리 일괄 수정.
 - `merchant_categories`: `merchant text not null`, `category text not null`, `source text not null check (source in ('llm','user'))`, `updated_at timestamptz not null default now()`, **`unique (user_id, merchant)`**. 사용자별 가맹점→카테고리 맵이다(ADR-009). 이게 있어야 2회차 업로드에서 같은 가맹점을 LLM에 다시 묻지 않고, 사용자의 수정이 다음 달에도 유지된다.
-- `recurring_charges`: `merchant text not null`, `median_amount numeric(14,2)`, `interval_days int`, `occurrences int`, `first_seen_at date`, `last_seen_at date`, `status text check (status in ('active','dormant'))`, `unique (user_id, merchant)`
-- `insights`: `statement_id uuid references statements(id) on delete cascade`, `kind text not null`, `payload jsonb not null`, `model text not null`
+- `recurring_charges`: `merchant text not null`, `median_amount numeric(14,0)`, `interval_days int`, `occurrences int`, `first_seen_at date`, `last_seen_at date`, `status text check (status in ('active','dormant'))`, `unique (user_id, merchant)`
+- `insights`: `statement_id uuid references statements(id) on delete cascade`, `kind text not null`, `payload jsonb not null`, `model text not null`, **`cache_key text not null`**, **`unique (user_id, cache_key)`**
+  - step 6이 `insightCacheKey()`를 만드는데 1차 설계에는 그 값을 담을 컬럼도, UPSERT를 가능하게 할 유니크 키도 없었다. 캐시를 강제할 수단이 없으면 대시보드를 열 때마다 LLM을 다시 부른다.
 - `subscriptions`: `polar_subscription_id text unique`, `status text not null`, `current_period_end timestamptz`, `unique (user_id)`
 
 ### 2. `supabase/migrations/0002_rls.sql`
