@@ -1,0 +1,18 @@
+{
+  "project": "FinSight",
+  "phase": "0-mvp",
+  "steps": [
+    { "step": 0, "name": "project-setup", "status": "pending" },
+    { "step": 1, "name": "core-types", "status": "pending" },
+    { "step": 2, "name": "csv-parser", "status": "pending" },
+    { "step": 3, "name": "supabase-schema", "status": "pending" },
+    { "step": 4, "name": "auth-flow", "status": "pending" },
+    { "step": 5, "name": "analytics-engine", "status": "pending" },
+    { "step": 6, "name": "anthropic-service", "status": "pending" },
+    { "step": 7, "name": "statements-api", "status": "pending" },
+    { "step": 8, "name": "dashboard-ui", "status": "pending" },
+    { "step": 9, "name": "billing", "status": "pending" },
+    { "step": 10, "name": "landing-page", "status": "pending" },
+    { "step": 11, "name": "deploy-prep", "status": "pending" }
+  ]
+}
