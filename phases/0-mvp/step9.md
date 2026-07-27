@@ -50,9 +50,12 @@ export const POST = Webhooks({
   onSubscriptionActive: async (payload) => { /* → pro */ },
   onSubscriptionRevoked: async (payload) => { /* → free */ },
   onSubscriptionCanceled: async (payload) => { /* 기간 만료까지는 pro 유지 */ },
+  onSubscriptionUncanceled: async (payload) => { /* 해지 취소 → pro 유지 */ },
   onSubscriptionUpdated: async (payload) => { /* 상태·기간 동기화 */ },
 });
 ```
+
+어댑터는 26개 이벤트 핸들러를 제공한다. 위 다섯 개만 쓴다. `onSubscriptionUncanceled`를 빠뜨리지 마라 — 해지를 눌렀다가 취소하는 흐름이 실제로 존재하고, 이 이벤트를 안 받으면 상태가 `canceled`에 머문다.
 
 동기화 로직은 `src/lib/billing.ts`에 두고 (`billing.test.ts` 먼저) 라우트는 호출만 한다.
 
@@ -67,8 +70,11 @@ export async function syncSubscription(args: {
 ```
 
 - `subscriptions` UPSERT (`onConflict: "user_id"`)
-- `profiles.plan`을 갱신: `status`가 `active`이거나, `canceled`인데 `currentPeriodEnd`가 미래면 `"pro"`. 그 외 `"free"`.
+- `profiles.plan`을 갱신: `status`가 `active`이거나, `canceled`·`past_due`인데 `currentPeriodEnd`가 미래면 `"pro"`. 그 외 `"free"`.
 - **해지 즉시 강등하지 마라.** 이미 결제한 기간은 사용할 수 있어야 한다.
+- **`past_due`도 즉시 강등하지 마라**(DE-08). 카드 한도 초과나 만료는 흔하고 대개 며칠 안에 해결된다. `currentPeriodEnd`까지를 유예로 삼아 Pro를 유지하고, 대시보드에 배너를 띄운다:
+  `"결제가 처리되지 않았습니다. 2026-08-05까지 Pro 기능을 계속 쓸 수 있습니다."`
+  유예가 끝나면 `revoked` 또는 기간 만료로 자연히 `free`가 된다.
 - 웹훅은 **멱등**이어야 한다. 같은 이벤트가 두 번 와도 결과가 같아야 한다 — UPSERT로 구현하고 카운터를 증가시키는 식의 처리를 하지 마라.
 - `externalId`로 프로필을 못 찾으면 조용히 무시하고 200을 반환한다. 5xx를 반환하면 Polar가 계속 재시도한다.
 
@@ -78,7 +84,15 @@ export async function syncSubscription(args: {
 - `PlanGate`의 잠금 카드와 헤더의 Free 배지에서 이 버튼을 쓴다
 - 헤더에 Pro 사용자용 "구독 관리"(→ `/api/portal`) 링크
 
-### 5. 보관 기간 만료 처리
+### 5. `src/app/api/me/plan/route.ts` (**`route.test.ts` 먼저**)
+
+`GET` — 현재 세션의 `{ plan, status, currentPeriodEnd }`를 반환한다.
+
+step 8의 결제 확인 대기 화면이 이걸 폴링한다(DE-07). **Polar가 `successUrl`로 리다이렉트하는 시점과 웹훅이 도착하는 시점은 순서가 보장되지 않는다** — 방금 결제한 사용자가 잠긴 화면을 보는 구간이 실제로 존재한다. `successUrl`에 checkout id를 실어 검증하는 방법은 `@polar-sh/nextjs` 문서에 명시돼 있지 않으므로 그 방식에 의존하지 마라. 이 엔드포인트를 짧게 폴링하는 쪽이 확실하다.
+
+캐시하지 마라 (`export const dynamic = "force-dynamic"`).
+
+### 6. 보관 기간 만료 처리
 
 **없다.** ADR-007에 따라 데이터를 지우지 않는다. `applyRetention`이 조회 시점에 가릴 뿐이므로, 강등되어도 삭제 작업이 필요 없고 업그레이드하면 즉시 전부 보인다. **삭제 크론이나 배치를 만들지 마라.**
 
@@ -87,6 +101,9 @@ export async function syncSubscription(args: {
 - `syncSubscription`: `active` → `plan: "pro"`
 - `canceled` + `currentPeriodEnd` 미래 → `"pro"` 유지
 - `canceled` + `currentPeriodEnd` 과거 → `"free"`
+- **`past_due` + `currentPeriodEnd` 미래 → `"pro"` 유지** (유예)
+- **`past_due` + `currentPeriodEnd` 과거 → `"free"`**
+- **`canceled` 뒤에 `uncanceled`가 오면 `"pro"`로 되돌아오는지**
 - `revoked` → `"free"`
 - 같은 페이로드 2회 처리 → 결과 동일 (멱등성)
 - 존재하지 않는 `externalId` → 예외 없이 종료
@@ -104,7 +121,9 @@ npm run test
 
 1. 위 AC 커맨드를 실행한다.
 2. 아키텍처 체크리스트:
-   - 세 `route.ts` 각각에 `route.test.ts`가 있는가?
+   - 네 `route.ts` 각각에 `route.test.ts`가 있는가? (checkout · portal · webhook · me/plan)
+   - `past_due`에서 즉시 강등하지 않는가?
+   - `onSubscriptionUncanceled`를 처리하는가?
    - `syncSubscription`이 `db`를 주입받는가?
    - `plan.ts`의 판정 로직을 복제하지 않았는가?
    - 데이터 삭제 코드가 없는가? (ADR-007)
@@ -119,6 +138,8 @@ npm run test
 
 - 분석 횟수로 플랜을 나누지 마라. 이유: 명세서는 월 1회 나온다(ADR-006).
 - 해지 즉시 Pro 기능을 끊지 마라. 이유: 이미 결제한 기간의 권리다.
+- `past_due`가 왔다고 즉시 강등하지 마라. 이유: 카드 만료·한도 초과는 흔하고 대개 며칠 안에 해결된다. 결제 한 번 실패했다고 기능을 끊으면 복구할 사용자까지 잃는다.
+- `successUrl`에 checkout id를 실어 결제를 검증하는 방식에 의존하지 마라. 이유: `@polar-sh/nextjs` 문서에 해당 치환 파라미터가 명시돼 있지 않다. `/api/me/plan` 폴링을 쓴다.
 - 보관 기간이 지난 데이터를 삭제하는 크론·배치를 만들지 마라. 이유: ADR-007. 조회에서 가리기만 한다.
 - 웹훅에서 실패 시 5xx를 반환하지 마라. 이유: Polar가 무한 재시도한다. 처리 불가는 로그를 남기고 200을 반환한다.
 - 웹훅에서 anon 클라이언트를 쓰지 마라. 이유: RLS 때문에 다른 사용자 행을 쓸 수 없다. service role 클라이언트가 필요하다.

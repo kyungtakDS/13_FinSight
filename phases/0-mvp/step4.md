@@ -5,6 +5,7 @@
 - `/CLAUDE.md` — 언어 규칙(UI 문자열 한국어), 서버 사이드 규칙
 - `/docs/ARCHITECTURE.md` — 디렉토리 구조의 `app/(marketing)`, `app/(app)/dashboard`, `app/auth`
 - `/docs/UI_GUIDE.md` — 입력 필드·버튼 클래스, 색상
+- `phases/0-mvp/USER_JOURNEY.md` — **9장 "계정 상태" 다이어그램이 이 step의 사양이다.** DE-01·DE-02·DE-09
 - `src/lib/supabase/{client,server}.ts` (step 3 산출물) — 새로 만들지 말고 이것을 쓴다
 - `src/lib/plan.ts` (step 3 산출물)
 
@@ -31,6 +32,17 @@ Supabase Auth 기반 이메일 로그인/회원가입과 세션 유지를 붙인
 - `src/app/auth/callback/route.ts` — **`route.ts`는 TDD Guard 면제가 아니다. `route.test.ts`를 먼저 만들어라.** `code`를 세션으로 교환(`exchangeCodeForSession`)하고 `next` 파라미터 또는 `/dashboard`로 리다이렉트한다.
 - `src/app/auth/error/page.tsx` — 한국어 에러 안내
 
+**아래 세 화면은 여정에서 길이 끊기는 지점을 막는다. 빠뜨리면 사용자가 되돌아올 방법이 없다.**
+
+- `src/app/auth/verify/page.tsx` (DE-02) — 가입 직후와, 미인증 상태로 로그인을 시도했을 때 도착하는 화면.
+  `"[이메일]로 인증 메일을 보냈습니다. 받은 편지함에 없으면 스팸함도 확인해주세요."` + **인증 메일 재발송 버튼**(`resend`).
+  미인증을 `"이메일 또는 비밀번호가 올바르지 않습니다."`로 뭉뚱그리지 마라 — 사용자는 비밀번호를 계속 다시 입력하게 된다.
+- `src/app/auth/reset/page.tsx` (DE-01) — 이메일 입력 → `resetPasswordForEmail`.
+  존재하지 않는 이메일이어도 **같은 문구**를 보여준다(계정 존재 여부가 새면 안 된다):
+  `"해당 이메일로 재설정 링크를 보냈습니다."`
+- `src/app/auth/reset/confirm/page.tsx` — 메일 링크로 들어온 복구 세션에서 새 비밀번호를 설정한다. 8자 미만이면 제출 전 차단.
+  로그인 화면에 `"비밀번호를 잊으셨나요?"` 링크를 반드시 건다. 이 링크가 없으면 위 두 화면은 도달 불가능하다.
+
 ### 3. 컴포넌트
 
 - `src/components/auth/AuthForm.tsx` (Client Component) — `AuthForm.test.tsx` 먼저.
@@ -49,6 +61,17 @@ Supabase Auth 기반 이메일 로그인/회원가입과 세션 유지를 붙인
 
 `src/components/auth/SignOutButton.tsx` (Client Component, 테스트 먼저) — `signOut()` 후 `/`로 이동.
 
+### 6. 계정 삭제 (DE-09)
+
+`src/app/api/account/route.ts` — **`route.test.ts` 먼저.**
+
+`DELETE` 요청. 세션의 user id를 확인한 뒤 `admin.ts`의 service role 클라이언트로 `auth.admin.deleteUser(userId)`를 호출한다. 나머지 테이블은 전부 `on delete cascade`이므로 추가 삭제 쿼리를 쓰지 마라.
+
+`src/app/(app)/settings/page.tsx` — 계정 설정. 삭제는 **자기 이메일을 다시 입력해야** 실행되게 한다.
+문구: `"계정과 모든 거래 내역이 삭제됩니다. 되돌릴 수 없습니다."`
+
+**이 기능을 생략하지 마라.** ADR-005(거래 원문 전량 보관) + ADR-007(삭제하지 않음)이 합쳐지면 떠난 사용자의 금융 거래 원문이 무기한 남는다. 삭제 경로는 그 부채를 갚는 최소 장치이고, cascade 덕분에 실제 코드는 짧다.
+
 ## Acceptance Criteria
 
 ```bash
@@ -61,7 +84,9 @@ npm run test
 
 1. 위 AC 커맨드를 실행한다.
 2. 아키텍처 체크리스트:
-   - `src/app/auth/callback/route.ts`에 대응하는 `route.test.ts`가 존재하는가?
+   - `src/app/auth/callback/route.ts`와 `src/app/api/account/route.ts` 각각에 `route.test.ts`가 존재하는가?
+   - 로그인 화면에서 비밀번호 재설정으로 갈 수 있는가? (링크가 없으면 화면을 만들어도 도달 불가)
+   - 미인증 상태가 자격 실패와 구분되어 안내되는가?
    - 클라이언트 컴포넌트가 `SUPABASE_SERVICE_ROLE_KEY`를 참조하지 않는가?
    - 사용자에게 보이는 문자열이 전부 한국어인가? (Supabase 원문 에러가 그대로 노출되지 않는가)
    - `src/lib/supabase/`의 기존 클라이언트를 재사용했는가? (새 클라이언트 생성 코드 중복 금지)

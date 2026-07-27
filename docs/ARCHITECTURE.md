@@ -23,6 +23,7 @@ supabase/migrations/        # SQL 마이그레이션 (테이블 + RLS)
 | `subscriptions` | Polar 구독 상태 미러 | `user_id`, `polar_subscription_id`, `status`, `current_period_end` |
 | `statements` | 업로드 1건 = 1 row | `user_id`, `filename`, `source_hint`, `period_start`, `period_end`, `row_count` |
 | `transactions` | **개별 거래 원본** | `user_id`, `statement_id`, `txn_date`, `description`, `merchant`, `amount`, `category`, `category_source`, `raw` (jsonb 원본 행) |
+| `merchant_categories` | 사용자별 가맹점→카테고리 맵 | `user_id`, `merchant`, `category`, `source`(`llm`\|`user`), unique `(user_id, merchant)` |
 | `recurring_charges` | 탐지된 반복 결제 | `user_id`, `merchant`, `median_amount`, `interval_days`, `last_seen_at`, `status`(`active`\|`dormant`) |
 | `insights` | LLM 생성 요약/제안 | `user_id`, `statement_id`, `kind`, `payload`(jsonb), `model` |
 
@@ -48,17 +49,22 @@ LLM 호출은 두 번뿐이다: ① 미분류 가맹점 목록 → 카테고리 
 ## 데이터 흐름
 
 ```
-[업로드]
-CSV 파일 (Client Component)
-  → POST /api/statements
-    → Supabase 세션 검증
-    → lib/csv: 인코딩 감지 → 헤더 매핑 → 마스킹 → Transaction[]
-    → statements + transactions INSERT (중복 스킵)
-    → 미분류 merchant 목록 추출
-    → services/anthropic.classifyMerchants() ─ LLM 호출 ①
-    → transactions.category UPDATE
-    → lib/recurring: 반복 결제 탐지 → recurring_charges UPSERT
-    → { statementId, insertedCount } 응답
+[업로드 — 2단계로 나눈다. 이유는 ADR-008]
+
+1단계  POST /api/statements                       (약 2초, 즉시 응답)
+  → Supabase 세션 검증
+  → lib/csv: 인코딩 감지 → 헤더 매핑 → 마스킹 → Transaction[]
+  → statements + transactions INSERT (지문으로 중복 스킵)
+  → merchant_categories에 이미 있는 가맹점은 즉시 category 채움 (LLM 없이)
+  → { statementId, insertedCount, duplicateCount, skippedRows,
+      unknownMerchantCount } 응답 → 사용자는 여기서 이미 거래 목록을 본다
+
+2단계  POST /api/statements/[id]/classify          (10~30초, 실패해도 1단계는 남는다)
+  → merchant_categories에 없는 merchant만 추출
+  → services/anthropic.classifyMerchants() ─ LLM 호출 ①
+  → merchant_categories UPSERT + transactions.category UPDATE
+  → lib/recurring: 누적 전체로 반복 결제 탐지 → recurring_charges UPSERT
+  → { classifiedCount } 응답
 
 [대시보드 조회]
 /dashboard (Server Component)
@@ -78,6 +84,8 @@ retentionCutoff(plan: Plan): Date | null   // free → 90일 전, pro → null
 ```
 
 Free 사용자의 조회 쿼리에는 `txn_date >= retentionCutoff(plan)` 필터가 붙는다. **데이터는 지우지 않는다** — 가려질 뿐이고 업그레이드하면 즉시 보인다.
+
+게이팅은 **목록 단위**다(ADR-010). 구독 탐지·이상 거래는 Free에서도 **건수와 총액을 계산해 보여주고**, 세부 목록만 잠근다. 실제로 계산한 값이므로 가짜 데이터가 아니다. AI 인사이트는 전체가 Pro다.
 
 ## 패턴
 - Server Components 기본. 인터랙션(업로드, 카테고리 수정, 차트 툴팁)이 필요한 곳만 Client Component.

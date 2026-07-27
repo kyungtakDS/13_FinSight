@@ -40,6 +40,16 @@ export type ParsedTransaction = Omit<Transaction, "id" | "statementId" | "catego
 
 zod 스키마 `transactionSchema`, `parsedTransactionSchema`도 같은 파일에 export 한다.
 
+`MerchantCategory` 인터페이스도 여기 둔다 — `merchant_categories` 테이블(ADR-009)에 대응한다.
+
+```ts
+export interface MerchantCategory {
+  merchant: string;
+  category: Category;
+  source: "llm" | "user";
+}
+```
+
 ### `src/types/statement.ts`
 
 `Statement` 인터페이스: `id`, `userId`, `filename`, `sourceHint`(카드사 추정, nullable), `periodStart`, `periodEnd`, `rowCount`, `createdAt`.
