@@ -1,0 +1,2 @@
+# hook 스크립트는 Windows(core.autocrlf=true)에서도 LF 로 체크아웃되어야 bash 가 실행할 수 있다
+*.sh text eol=lf
