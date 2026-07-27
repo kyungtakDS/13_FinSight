@@ -27,6 +27,7 @@
 | `docs/UI_GUIDE.md` | 색·차트 규칙·컴포넌트 클래스 | ✅ |
 | `phases/0-mvp/USER_JOURNEY.md` | 여정 다이어그램 6개·유스케이스 30건·화면×상태 매트릭스 | ❌ (필요한 step만 참조) |
 | `phases/0-mvp/step0~11.md` | 12개 실행 단위 | 해당 step만 |
+| `DEPLOY_CHECKLIST.md` | 자격증명이 없어 미룬 수동 검증 항목. 각 step이 append, step 11이 정리 | ❌ |
 | `plan.md` | 이 문서 | ❌ |
 
 ---
@@ -40,7 +41,7 @@
 3. **기간별 지출 추이** — 월별 총지출과 전월 대비 증감
 4. **구독 누수 / 이상 거래 탐지** — 규칙·통계 기반
 5. **AI 요약 & 절약 인사이트** — 집계 결과를 근거로 한국어 서술
-6. **구독 결제** — Polar
+6. **구독 결제 (Polar)** — Free/Pro 구분, 웹훅으로 상태 동기화
 7. **계정 수명 관리** — 비밀번호 재설정, 미인증 안내, 계정·명세서 삭제
 
 ### 요금제
@@ -94,7 +95,9 @@
 
 **`profiles`·`subscriptions`에는 사용자 쓰기 정책이 없다.** RLS는 행 단위라 UPDATE를 열면 `plan` 컬럼까지 열리고, 브라우저에서 `update({plan:'pro'})` 한 줄로 결제가 우회된다.
 
-`statements`에는 분류 중복 실행을 막기 위한 `classification_status`와 `classified_at`을 둔다. 이는 분석 파생값 저장이 아니라 외부 LLM 작업의 실행 상태다.
+`statements`에는 분류 중복 실행을 막기 위한 `classification_status` · `classification_started_at` · `classified_at`을 둔다. 이는 분석 파생값 저장이 아니라 외부 LLM 작업의 실행 상태다. `classification_started_at`이 있어야 함수가 분류 도중 죽어 `processing`에 갇힌 명세서를 10분 뒤 회수할 수 있다 — 없으면 "다시 분류하기"가 영구히 409를 반환한다.
+
+원자성이 필요한 두 작업은 Postgres 함수로 둔다(`0004_functions.sql`). supabase-js는 여러 문장을 한 트랜잭션으로 묶지 못하므로, 명세서 삭제와 카테고리 일괄 수정은 각각 인사이트 무효화와 함께 한 번에 끝나야 한다. 두 함수 모두 `security invoker`라 RLS가 그대로 적용된다.
 
 ---
 
@@ -156,14 +159,14 @@ LLM 호출은 명세서당 **최대 2번**이고, 둘 다 쓰기 경로에서만
 |---|---|---|---|
 | 0 | `project-setup` | package.json → 의존성 → 설정 → `lib/format.ts` | ⚠ **package.json이 최우선.** Stop 훅이 매 세션 `lint && build && test`를 돌린다. `create-next-app` 금지 |
 | 1 | `core-types` | `src/types/` 전체 | types/는 TDD 면제 — 로직 금지 |
-| 2 | `csv-parser` | `parseStatementCsv`, `normalizeMerchant`, 마스킹, 지문 | 지문에 `occurrence` 필수(정상 중복 보존) |
+| 2 | `csv-parser` | `parseStatementCsv`, `normalizeMerchant`, 마스킹, 지문 | 지문에 `occurrence` 필수(정상 중복 보존), 카드번호는 Luhn 통과분만 마스킹, 주민번호 패턴 포함 |
 | 3 | `supabase-schema` | 마이그레이션 4종 + 클라이언트 3종 + `plan.ts` | AC: RLS 5테이블 grep, 분류 상태 필드 |
 | 4 | `auth-flow` | 로그인·가입·콜백·미인증 안내·비밀번호 재설정·계정 삭제 | 계정 삭제는 세션 id만 사용 |
 | 5 | `analytics-engine` | 순수 함수 6종 | KST 버킷팅, MAD z>3.5, 탐지는 전체 이력 |
 | 6 | `anthropic-service` | `classifyMerchants` / `generateInsights` | `max_tokens: 16000`, `temperature` 금지 |
-| 7 | `statements-api` | `ingest.ts` + `classify.ts` + 라우트 5개 | 1단계에 LLM 금지, 1000행 청크, 단기 남용 방지, 인사이트 무효화 |
+| 7 | `statements-api` | `ingest.ts` + `classify.ts` + 라우트 5개 | 1단계에 LLM 금지, 1000행 청크, 단기 남용 방지, 인사이트 무효화, 내보내기 CSV 수식 이스케이프 |
 | 8 | `dashboard-ui` | Server Component + 컴포넌트 15종 | LLM 호출 0건, 상태 매트릭스 전 칸 처리 |
-| 9 | `billing` | Polar 라우트 4개 + `syncSubscription` | checkout 세션 검증, 웹훅 순서 가드 |
+| 9 | `billing` | Polar 라우트 4개 + `syncSubscription` | checkout 세션 검증, 웹훅 순서 가드, `past_due`는 기간 만료까지 유예 |
 | 10 | `landing-page` | 랜딩 + 요금제 + `/help/csv` | 안티패턴 금지, 한계 명시 |
 | 11 | `deploy-prep` | README · DEPLOY_CHECKLIST · SECURITY · 샘플 CSV | 실제 배포 시도 금지 |
 
@@ -213,6 +216,7 @@ step을 순차 실행하며 step 단위로 커밋하고, 실패 시 최대 3회 
 - [ ] 다른 계정으로 로그인해 앞 계정의 거래가 보이지 않는가 (RLS)
 - [ ] 업로드한 테스트용 주민번호·카드번호가 DB의 `raw`에서도 마스킹됐는가
 - [ ] 이체 행이 섞인 파일 업로드 후 LLM 요청에 사람 이름이 없는가
+- [ ] 내보낸 CSV에서 `=`로 시작하는 가맹점명이 `'=`로 이스케이프됐는가 (엑셀로 열어 확인)
 - [ ] KST 매월 1일 오전 거래가 그 달 합계에 잡히는가
 
 ---
