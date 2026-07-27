@@ -75,11 +75,18 @@
 `src/lib/format.test.ts`를 **먼저** 작성한 뒤 `src/lib/format.ts`를 구현하라 (TDD Guard 훅이 역순을 막는다).
 
 ```ts
-export function formatKRW(amount: number): string   // 1234567 → "₩1,234,567"
+export function formatKRW(amount: number): string    // 1234567 → "₩1,234,567"
 export function formatDate(d: Date | string): string // → "2026-07-27"
+
+/** KST 기준 날짜 문자열. 배포 환경이 UTC라 이 변환 없이는 월 경계가 밀린다. */
+export function toKstDateString(d: Date): string      // → "2026-07-27"
+/** KST 기준 월 버킷 */
+export function toKstMonthKey(d: Date): string        // → "2026-07"
 ```
 
 `formatKRW`는 음수(`-₩1,234`)와 0(`₩0`)을 처리해야 한다.
+
+**KST 변환을 직접 `+9시간` 산술로 구현하지 마라.** `Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Seoul" })`를 쓰면 `YYYY-MM-DD`가 바로 나온다. 테스트에는 **경계 케이스를 반드시 넣어라** — `2026-08-01T00:30:00+09:00`(= UTC로는 7월 31일 15:30)이 `"2026-08-01"`과 `"2026-08"`로 나와야 한다. 이 한 줄이 월별 합계 전체의 정확성을 좌우한다.
 
 ### 5. `.env.example`
 

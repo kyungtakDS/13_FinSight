@@ -31,6 +31,8 @@ export function periodTrend(txns: Transaction[], granularity: "month" | "week"):
 
 기간별 총지출과 카테고리별 내역. **거래가 없는 중간 기간도 `total: 0`으로 채운다** — 차트에 구멍이 생기면 추이가 왜곡된다. 기간 오름차순 정렬.
 
+**기간 버킷은 반드시 KST로 계산한다.** step 0의 `toKstMonthKey`를 쓰고, `new Date().getMonth()` 같은 로컬 시각 API를 쓰지 마라. Vercel 함수는 UTC로 돌기 때문에 KST 매월 1일 00:00~09:00 거래가 전월 버킷에 들어가 월 합계가 틀린다. 가계부 앱에서 이건 조용히 틀리는 종류의 버그라 가장 위험하다.
+
 ```ts
 export function periodOverPeriodDelta(points: PeriodPoint[]): {
   current: PeriodPoint;
@@ -95,6 +97,8 @@ export function applyRetention(txns: Transaction[], plan: Plan, now?: Date): Tra
 
 - `categoryBreakdown`: 환불(음수) 차감, 전체 0일 때 share 0, `null` 카테고리 → 기타
 - `periodTrend`: 거래 없는 중간 달이 0으로 채워지는지
+- **`periodTrend`: KST 8월 1일 00:30 거래가 `"2026-08"` 버킷에 들어가는지** (프로세스 TZ를 UTC로 고정한 상태에서 단언하라 — `process.env.TZ = "UTC"`)
+- **`applyRetention`: 컷오프 경계일이 KST 기준으로 계산되는지**
 - `detectRecurring`: 월간 구독 6회 → 탐지됨 / 금액이 30% 튀는 건 → 미탐지 / 2회만 → 미탐지 / 마지막 결제가 3개월 전 월간 구독 → `dormant`
 - `detectAnomalies`: MAD가 0인 카테고리에서 예외가 나지 않는지, 표본 5건 미만 스킵
 - `applyRetention`: free는 90일 이전 제외, pro는 전량 유지
@@ -124,6 +128,7 @@ npm run test
 - 이 step에서 LLM을 호출하지 마라. 이유: CRITICAL 규칙이자 이 프로젝트의 핵심 설계다(ADR-003). 산술은 검증 가능해야 한다.
 - DB에서 데이터를 읽지 마라. 이유: 순수 함수로 두어야 테스트가 결정론적이다. 조회는 step 7·8에서 붙인다.
 - 부동소수점으로 금액을 누적하며 반올림하지 마라. 이유: 원 단위 오차가 누적된다. 정수 원 단위로 다루고 표시할 때만 포맷한다.
+- 기간 경계를 서버 로컬 시각으로 계산하지 마라. 이유: Vercel은 UTC다. 반드시 KST로 버킷팅한다.
 - 평균(mean)과 표준편차로 이상치를 잡지 마라. 이유: 지출 분포는 꼬리가 길어 평균이 이상치에 끌려간다. MAD를 쓰라고 명시한 이유다.
 - `detectRecurring`·`detectAnomalies`에 보관 기간 필터를 먼저 걸지 마라. 이유: 반복 결제는 3회 누적이 조건이라 90일 컷오프와 정면으로 충돌한다. 필터를 거치면 Free 사용자에게 보여줄 수치가 0이 되고 ADR-010이 무의미해진다.
 - `duplicate_suspect` 판정 대상이 파서 단계에서 이미 제거되지 않았는지 확인하라. 이유: 지문에 `occurrence`가 들어가야 같은 날 같은 금액 거래 2건이 살아남는다(step 2). 안 그러면 이 규칙은 절대 발동하지 않는다.

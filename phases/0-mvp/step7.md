@@ -41,7 +41,10 @@ export async function ingestStatement(args: {
 순서:
 1. `parseStatementCsv(buffer, filename)` — 실패 시 한국어 에러 전파
 2. `statements` INSERT (`period_start`, `period_end`, `source_hint`, `row_count`)
-3. 각 거래에 `transactionFingerprint`를 붙여 `transactions`에 **upsert** — `onConflict: "user_id,fingerprint"` + `ignoreDuplicates: true`. 삽입된 행 수와 중복 수를 센다.
+3. 각 거래에 `transactionFingerprint`를 붙여 `transactions`에 **upsert** — `onConflict: "user_id,fingerprint"` + `ignoreDuplicates: true`.
+   - **1,000행 단위로 나눠 보내라.** step 2가 상한을 50,000행으로 잡았는데 한 번에 보내면 `raw` jsonb까지 포함된 요청 바디가 PostgREST 한도를 넘는다. supabase-js는 자동 분할하지 않는다. 자기 사양의 상한에서 죽는 코드를 만들지 마라.
+   - 삽입된 행 수는 `.select("id")`를 체이닝해 반환된 행 수로 센다(`ignoreDuplicates`는 중복 행을 반환하지 않는다). 중복 수 = 보낸 수 − 삽입된 수.
+   - 청크 진행 상황을 셀 수 있으므로 1단계 응답 품질도 같이 올라간다.
 4. **`merchant_categories`에서 이 사용자의 맵을 읽어 아는 가맹점의 `category`를 즉시 채운다** (`category_source`는 맵의 `source`를 따른다). **여기서 LLM을 호출하지 마라.**
 5. 맵에 없는 가맹점 수를 `unknownMerchantCount`로 반환하고 종료한다.
 
@@ -62,7 +65,8 @@ export async function classifyStatement(args: {
 **이 함수는 명세서 단위가 아니라 사용자 단위로 동작한다.** 미분류 거래는 여러 명세서에 걸쳐 있을 수 있고, 반복 결제 탐지는 누적 전체를 봐야 한다. `statementId`는 소유권 확인과 인사이트 캐시 키에만 쓴다. 이 점을 함수 주석에 적어라 — 이름만 보면 명세서 하나만 처리하는 것처럼 읽힌다.
 
 순서:
-1. 이 사용자의 거래 중 **`category`가 null인 것의 유니크 `merchant` 목록**을 조회
+1. 이 사용자의 거래 중 **`category`가 null이고 `is_transfer = false`인 것의 유니크 `merchant` 목록**을 조회
+   - **이체 행은 반드시 제외한다 (CRITICAL, 개인정보).** 적요에 제3자의 실명이 들어 있어 외부 API로 보내면 안 된다. 이체 행은 LLM 없이 `기타`로 채운다.
 2. 그중 `merchant_categories`에 없는 것만 `classifyMerchants()`에 넘긴다. **목록이 비면 LLM을 호출하지 마라.**
 3. 결과를 `merchant_categories`에 UPSERT (`onConflict: "user_id,merchant"`, `source: "llm"`) — **`source: "user"`인 행은 덮어쓰지 마라.**
 4. 맵을 근거로 `transactions.category`를 UPDATE. 여기서도 `category_source: "user"`인 거래는 건드리지 마라.
@@ -81,7 +85,8 @@ export async function classifyStatement(args: {
 
 - 세션 없으면 `401` + `{ error: "로그인이 필요합니다." }`
 - 파일 없음 / `.csv`가 아님 → `400` + 한국어 메시지
-- 파일 크기 10MB 초과 → `413` + `"파일이 너무 큽니다. 10MB 이하로 올려주세요."`
+- 파일 크기 10MB 초과 → `413` + `"파일이 너무 큽니다. 10MB 이하로 올려주세요."` (`file.size`로 **버퍼에 읽기 전에** 판정한다)
+- 파일 최상단에 `export const runtime = "nodejs";` — `iconv-lite`가 Node `Buffer`를 쓴다. Edge 런타임으로 잡히면 CP949 디코딩이 죽는다.
 - 성공 → `200` + `IngestResult`
 - 파싱 에러 → `400` + 파서가 던진 한국어 메시지
 - 그 외 예외 → `500` + `"분석 중 오류가 발생했습니다."` (내부 에러 원문을 클라이언트에 노출하지 마라. 서버 로그에만 남긴다.)
@@ -108,9 +113,43 @@ export async function classifyStatement(args: {
 - **`applyToMerchant`가 true면(기본값) 같은 `merchant`의 모든 거래에 반영하고 `merchant_categories`에 `source: "user"`로 UPSERT 한다** (DE-06).
   이유: 한 건만 고치면 같은 가맹점 수십 건이 그대로 남아 사용자가 같은 수정을 반복하게 되고, 다음 달에 또 틀린다. 응답에 반영된 건수를 실어 보내라 — 화면에서 `"스타벅스 42건을 식비로 바꿨습니다."`를 보여줄 수 있어야 한다.
 
-### 6. 업로드 제한
+### 6. `src/app/api/statements/[id]/route.ts` (**`route.test.ts` 먼저**)
+
+`DELETE` — 잘못 올린 명세서를 지운다.
+
+엉뚱한 파일을 올렸을 때 되돌릴 방법이 지금 없다. 카테고리 수정으로도, 재업로드로도 안 되고 유일한 탈출구가 계정 삭제다. `transactions`가 `on delete cascade`라 실제 코드는 짧다.
+
+- 세션 검증 + 소유권 확인(RLS가 막지만 404를 주기 위해 명시적으로도)
+- 삭제 후 `detectRecurring`을 다시 돌려 `recurring_charges`를 갱신한다 — 남은 거래 기준으로 다시 계산해야 한다
+- 응답에 삭제된 거래 수를 실어 `"명세서와 거래 234건을 삭제했습니다."`를 보여줄 수 있게 한다
+
+### 7. `src/app/api/export/route.ts` (**`route.test.ts` 먼저**)
+
+`GET` — Pro 전용 CSV 내보내기. `docs/PRD.md` 요금제 표가 파는 기능인데 1차 설계의 어느 step에도 구현이 없었다.
+
+- `canAccess(plan, "csv_export")`가 false면 `403` + `"Pro 플랜에서 이용할 수 있습니다."`
+- 보관 기간 필터를 적용한 거래를 UTF-8 BOM 포함 CSV로 반환 (BOM이 없으면 엑셀에서 한글이 깨진다)
+- 헤더: `거래일자,적요,가맹점,금액,카테고리`
+- `Content-Disposition: attachment; filename="finsight-2026-07-27.csv"`
+
+**CSV 수식 인젝션을 막아라 (CRITICAL).**
+
+```ts
+function csvCell(v: string): string {
+  const s = /^[=+\-@\t\r]/.test(v) ? `'${v}` : v;
+  return `"${s.replace(/"/g, '""')}"`;
+}
+```
+
+가맹점명은 **사용자가 올린 파일에서 온 문자열**이다. `=HYPERLINK("http://evil","클릭")` 같은 값이 그대로 나가면 내려받은 CSV를 엑셀에서 열 때 수식으로 실행된다. 내보낸 파일은 회계 담당자에게 전달되기도 한다.
+
+### 8. 업로드 제한
 
 **횟수 제한을 만들지 마라** (ADR-006). Free/Pro 모두 업로드 무제한이다. 플랜은 조회 범위와 기능으로만 갈린다.
+
+단, **남용 방지 상한은 별개다.** 분류 엔드포인트는 호출할 때마다 LLM 비용이 나가므로 사용자당 **시간당 20회** 상한을 둔다. 정상 사용은 월 1~4회라 실사용자는 절대 닿지 않는 선이고, ADR-006의 "제품 쿼터를 두지 않는다"와 충돌하지 않는다. 초과 시 `429` + `"요청이 너무 많습니다. 잠시 후 다시 시도해주세요."`
+
+상한 카운터는 별도 테이블 없이 `statements`/`insights`의 최근 `created_at` 개수로 판정한다.
 
 ### 테스트에 반드시 포함할 케이스
 
@@ -125,6 +164,11 @@ export async function classifyStatement(args: {
 - **인사이트 캐시가 있으면 `generateInsights`가 호출되지 않는지**
 - **인사이트 생성이 실패해도 분류·반복결제 결과가 유지되고 `insightsGenerated: false`가 반환되는지**
 - **plan이 `free`면 `generateInsights`가 호출되지 않는지**
+- **`isTransfer: true`인 거래의 `merchant`가 `classifyMerchants`에 넘어가지 않는지** (개인정보 — 반드시 단언하라)
+- **5만 행 입력이 1,000행 단위로 나뉘어 전송되는지** (호출 횟수 단언)
+- **내보내기: `=cmd`로 시작하는 가맹점명이 `'=cmd`로 이스케이프되는지**
+- **내보내기: Free 플랜은 403인지**
+- **명세서 삭제: 남의 `statementId`는 404, 삭제 후 `recurring_charges`가 재계산되는지**
 - **`applyToMerchant: true`로 수정하면 같은 가맹점 전체가 바뀌고 `merchant_categories`에 `source: "user"`로 남는지**
 - 파서가 던진 한국어 에러가 400 응답 본문에 그대로 실리는지
 - 예상치 못한 예외의 원문이 응답에 **노출되지 않는지**
@@ -162,4 +206,8 @@ npm run test
 - **파싱·저장과 LLM 분류를 한 요청에 묶지 마라.** 이유: 분류가 실패하면 파싱 결과까지 잃고, 사용자는 30초를 기다린 끝에 아무것도 얻지 못한 채 처음부터 다시 해야 한다(ADR-008).
 - **분류 실패 시 이미 저장한 거래를 롤백하지 마라.** 이유: 미분류 상태로 남기고 재시도하게 두는 것이 이 설계의 목적이다.
 - **이미 아는 가맹점을 LLM에 다시 묻지 마라.** 이유: 명세서는 매달 온다. `merchant_categories`를 먼저 조회하지 않으면 같은 질문에 매달 돈을 낸다(ADR-009).
+- **이체 행의 `merchant`를 LLM에 보내지 마라.** 이유: 제3자의 실명이다. 우리가 공지한 "가맹점명 전송"의 범위를 넘는다.
+- 5만 행을 한 번에 upsert 하지 마라. 이유: 요청 바디 한도를 넘어 자기 사양의 상한에서 죽는다.
+- 내보내기 CSV 셀을 이스케이프 없이 쓰지 마라. 이유: `=`로 시작하는 가맹점명이 엑셀에서 수식으로 실행된다.
+- CSV 파싱 라우트를 Edge 런타임으로 두지 마라. 이유: `iconv-lite`가 Node `Buffer`를 쓴다.
 - 기존 테스트를 깨뜨리지 마라.

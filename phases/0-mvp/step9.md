@@ -17,18 +17,32 @@
 
 ### 1. `src/app/api/checkout/route.ts`
 
+어댑터가 만드는 핸들러를 **그대로 export 하지 마라.** 감싸서 세션 검증을 먼저 한다:
+
 ```ts
 import { Checkout } from "@polar-sh/nextjs";
 
-export const GET = Checkout({
+const checkout = Checkout({
   accessToken: process.env.POLAR_ACCESS_TOKEN!,
   successUrl: `${process.env.NEXT_PUBLIC_SITE_URL}/dashboard?upgraded=1`,
   server: process.env.POLAR_SERVER as "sandbox" | "production",
 });
+
+export async function GET(req: NextRequest) {
+  const user = await getSessionUser();                    // lib/supabase/server.ts
+  if (!user) return NextResponse.redirect(new URL("/auth/login", req.url));
+
+  const external = req.nextUrl.searchParams.get("customerExternalId");
+  if (external !== user.id) {
+    return NextResponse.json({ error: "잘못된 요청입니다." }, { status: 403 });
+  }
+  return checkout(req);
+}
 ```
 
-호출은 `/api/checkout?products=<POLAR_PRODUCT_ID_PRO>&customerExternalId=<supabase user id>` 형태다.
-`customerExternalId`에 **Supabase user id를 넣는 것이 핵심**이다 — 웹훅에서 이 값으로 사용자를 찾는다. 업그레이드 버튼을 만들 때 이 파라미터를 빠뜨리지 마라.
+**`customerExternalId`를 클라이언트가 정하게 두지 마라 (CRITICAL, ADR-012).** 이 값은 쿼리 파라미터라 사용자가 바꿀 수 있고, 웹훅은 이 값으로 어느 계정을 업그레이드할지 결정한다. 남의 user id를 넣으면 **내 Polar 고객이 남의 계정에 연결**되고, 이후 내 구독이 해지될 때 그 사람이 강등된다. 고객 포털도 엉뚱한 계정에 물린다.
+
+세션 id와 대조해 다르면 403으로 막는 것이 최소 조치다. 더 확실하게 하려면 파라미터를 아예 무시하고 서버에서 주입해도 된다.
 
 ### 2. `src/app/api/portal/route.ts`
 
@@ -69,6 +83,8 @@ export async function syncSubscription(args: {
 }): Promise<void>;
 ```
 
+- **오래된 이벤트를 먼저 걸러낸다.** 저장된 행의 `current_period_end`(또는 페이로드의 `modified_at`)보다 오래된 이벤트가 들어오면 **아무것도 하지 않고 200을 반환한다.**
+  웹훅은 순서를 보장하지 않고 재시도까지 있다. 무조건 UPSERT 하면 늦게 도착한 옛 이벤트가 최신 상태를 되돌린다 — 해지 취소 직후 도착한 늦은 `canceled`가 다시 해지 상태로 만드는 식이다. 멱등성만으로는 이 문제가 풀리지 않는다.
 - `subscriptions` UPSERT (`onConflict: "user_id"`)
 - `profiles.plan`을 갱신: `status`가 `active`이거나, `canceled`·`past_due`인데 `currentPeriodEnd`가 미래면 `"pro"`. 그 외 `"free"`.
 - **해지 즉시 강등하지 마라.** 이미 결제한 기간은 사용할 수 있어야 한다.
@@ -106,7 +122,10 @@ step 8의 결제 확인 대기 화면이 이걸 폴링한다(DE-07). **Polar가 
 - **`canceled` 뒤에 `uncanceled`가 오면 `"pro"`로 되돌아오는지**
 - `revoked` → `"free"`
 - 같은 페이로드 2회 처리 → 결과 동일 (멱등성)
+- **오래된 이벤트가 뒤늦게 도착 → 최신 상태를 되돌리지 않는지** (순서 보장 없음)
 - 존재하지 않는 `externalId` → 예외 없이 종료
+- **`/api/checkout`에 세션과 다른 `customerExternalId`를 넣으면 403인지**
+- **미인증 상태로 `/api/checkout` 호출 시 로그인으로 보내는지**
 - 웹훅 라우트: 서명이 틀린 요청이 거부되는지 (어댑터가 처리하지만 라우트가 시크릿을 넘기는지 확인)
 
 ## Acceptance Criteria
@@ -143,5 +162,7 @@ npm run test
 - 보관 기간이 지난 데이터를 삭제하는 크론·배치를 만들지 마라. 이유: ADR-007. 조회에서 가리기만 한다.
 - 웹훅에서 실패 시 5xx를 반환하지 마라. 이유: Polar가 무한 재시도한다. 처리 불가는 로그를 남기고 200을 반환한다.
 - 웹훅에서 anon 클라이언트를 쓰지 마라. 이유: RLS 때문에 다른 사용자 행을 쓸 수 없다. service role 클라이언트가 필요하다.
+- **`Checkout(...)`이 만든 핸들러를 그대로 `export const GET`으로 내보내지 마라.** 이유: `customerExternalId`가 검증 없이 통과해 남의 계정에 구독이 붙는다(ADR-012).
+- 웹훅 이벤트가 순서대로 온다고 가정하지 마라. 이유: 재시도와 병렬 전송 때문에 옛 이벤트가 나중에 도착한다. 시각을 비교해 오래된 것은 버린다.
 - `POLAR_ACCESS_TOKEN` 등에 `NEXT_PUBLIC_` 접두사를 붙이지 마라. 이유: 브라우저에 노출된다.
 - 기존 테스트를 깨뜨리지 마라.

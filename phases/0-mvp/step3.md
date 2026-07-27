@@ -38,8 +38,22 @@ SQL 마이그레이션과 Supabase 클라이언트 헬퍼를 만든다. **이 st
 **CRITICAL — 모든 테이블에 RLS를 켜고 정책을 붙인다.** 정책 없는 테이블이 하나라도 남으면 이 step은 실패다.
 
 - `alter table <t> enable row level security;` × 7
-- 각 테이블에 select / insert / update / delete 정책. 조건은 `auth.uid() = user_id` (`profiles`는 `auth.uid() = id`).
-- `subscriptions`는 **사용자가 직접 쓰지 못하게** 한다: select만 `auth.uid() = user_id`로 허용하고 insert/update/delete 정책을 만들지 않는다. 웹훅이 service role로 쓴다.
+- 데이터 테이블(`statements`, `transactions`, `merchant_categories`, `recurring_charges`, `insights`)에 select / insert / update / delete 정책. 조건은 `auth.uid() = user_id`.
+- **`profiles`와 `subscriptions`에는 사용자 UPDATE / INSERT / DELETE 정책을 만들지 마라. select만 허용한다** (`profiles`는 `auth.uid() = id`). 쓰기는 웹훅과 트리거가 service role로만 한다.
+
+  **이유 (권한 상승 취약점, ADR-012):** RLS는 **행 단위** 정책이다. `profiles`에 `for update using (auth.uid() = id)`를 붙이면 그 행의 **모든 컬럼**이 열린다. 즉 브라우저에서 이 한 줄로 결제가 우회된다:
+
+  ```js
+  await supabase.from("profiles").update({ plan: "pro" }).eq("id", myId)   // 통과해버린다
+  ```
+
+  Supabase는 `authenticated` 롤에 기본 DML 권한을 부여하므로 PostgREST로 그대로 노출된다. `plan`은 웹훅만 쓰는 컬럼이니 사용자 UPDATE 정책 자체를 만들지 않는 것이 옳다.
+
+  나중에 `profiles`에 사용자가 편집할 컬럼(닉네임 등)이 생기면 정책을 여는 대신 **컬럼 단위 권한**을 쓴다:
+  ```sql
+  revoke update on public.profiles from authenticated;
+  grant update (display_name) on public.profiles to authenticated;
+  ```
 
 ### 3. `supabase/migrations/0003_profile_trigger.sql`
 
@@ -67,6 +81,8 @@ export function canAccess(plan: Plan, feature: Feature): boolean;
 export function retentionCutoff(plan: Plan, now?: Date): Date | null;  // free → now-90일, pro → null
 ```
 
+컷오프 날짜는 **KST 기준**으로 계산한다(step 0의 `toKstDateString`). 조회 쿼리에 `.gte("txn_date", …)`로 들어가는 값이라 하루가 밀리면 경계일 거래가 통째로 사라진다.
+
 `docs/PRD.md`의 요금제 표가 사양이다. Free에 허용되는 것은 카테고리 분류와 최근 3개월 추이뿐이고, `recurring_detection` / `anomaly_detection` / `ai_insights` / `csv_export` / `unlimited_history`는 Pro 전용이다.
 
 ## Acceptance Criteria
@@ -83,6 +99,7 @@ grep -c "enable row level security" supabase/migrations/0002_rls.sql   # 7 이�
 1. 위 AC 커맨드를 실행한다. `grep` 결과가 7 미만이면 실패로 간주하고 정책을 보완하라.
 2. 아키텍처 체크리스트:
    - 7개 테이블 전부 RLS가 켜져 있고 정책이 있는가?
+   - **`profiles`와 `subscriptions`에 사용자 UPDATE 정책이 없는가?** (`grep -n "on profiles" supabase/migrations/0002_rls.sql` 로 확인 — `for update`가 나오면 안 된다)
    - `transactions`에 `unique (user_id, fingerprint)`가 있는가?
    - `admin.ts`에 `import "server-only"`가 있는가?
    - 환경변수를 모듈 최상단에서 읽는 코드가 없는가? (키 없이 build가 통과해야 한다)
@@ -95,6 +112,7 @@ grep -c "enable row level security" supabase/migrations/0002_rls.sql   # 7 이�
 
 - 실제 Supabase 프로젝트에 접속하거나 마이그레이션을 적용하려 하지 마라. 이유: 이 step은 파일 작성까지다. 자격증명이 없어 반드시 실패한다.
 - RLS 없는 테이블을 만들지 마라. 이유: 금융 데이터에서 계정 간 격리는 애플리케이션 코드가 아니라 DB가 보장해야 한다.
+- **`profiles`에 사용자 UPDATE 정책을 만들지 마라.** 이유: RLS는 행 단위라 `plan` 컬럼까지 열린다. 사용자가 스스로 `pro`가 될 수 있다(ADR-012).
 - 보관 기간이 지난 데이터를 삭제하는 로직을 만들지 마라. 이유: ADR-007 — 가리기만 하고 지우지 않는다.
 - `service_role` 키를 `NEXT_PUBLIC_` 접두사가 붙은 변수로 읽지 마라. 이유: 브라우저에 노출된다.
 - 기존 테스트를 깨뜨리지 마라.

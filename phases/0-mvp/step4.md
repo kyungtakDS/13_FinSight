@@ -50,6 +50,7 @@ Supabase Auth 기반 이메일 로그인/회원가입과 세션 유지를 붙인
   - 제출 시 `createBrowserClient`로 `signInWithPassword` / `signUp` 호출
   - 로딩 중 버튼 비활성화, 에러는 **한국어로** 표시 (Supabase 영문 에러를 그대로 노출하지 마라 — 매핑 테이블을 두고 `"이메일 또는 비밀번호가 올바르지 않습니다."` 같은 문구로 바꾼다)
   - 비밀번호 8자 미만이면 제출 전에 `"비밀번호는 8자 이상이어야 합니다."`
+  - **가입에서 계정 존재 여부를 노출하지 마라.** Supabase의 `User already registered`를 그대로 보여주면 이메일 열거가 된다. 재설정 화면과 같은 원칙으로, 성공·중복 모두 `"인증 메일을 보냈습니다. 받은 편지함을 확인해주세요."`로 통일한다.
 
 ### 4. 보호 레이아웃
 
@@ -65,7 +66,9 @@ Supabase Auth 기반 이메일 로그인/회원가입과 세션 유지를 붙인
 
 `src/app/api/account/route.ts` — **`route.test.ts` 먼저.**
 
-`DELETE` 요청. 세션의 user id를 확인한 뒤 `admin.ts`의 service role 클라이언트로 `auth.admin.deleteUser(userId)`를 호출한다. 나머지 테이블은 전부 `on delete cascade`이므로 추가 삭제 쿼리를 쓰지 마라.
+`DELETE` 요청. **user id는 오직 서버 세션에서만 읽는다.** 요청 바디·쿼리·헤더로 들어온 user id를 절대 쓰지 마라 — 이 라우트는 service role로 `auth.admin.deleteUser()`를 부르므로, 입력을 신뢰하는 순간 **임의 계정 삭제 도구**가 된다.
+
+세션에서 얻은 id로 `admin.ts`의 service role 클라이언트가 `auth.admin.deleteUser(userId)`를 호출한다. 나머지 테이블은 전부 `on delete cascade`이므로 추가 삭제 쿼리를 쓰지 마라.
 
 `src/app/(app)/settings/page.tsx` — 계정 설정. 삭제는 **자기 이메일을 다시 입력해야** 실행되게 한다.
 문구: `"계정과 모든 거래 내역이 삭제됩니다. 되돌릴 수 없습니다."`
@@ -101,4 +104,7 @@ npm run test
 - Supabase 영문 에러 메시지를 그대로 UI에 노출하지 마라. 이유: 한국어 우선이 CRITICAL 규칙이다.
 - 대시보드 실제 콘텐츠를 만들지 마라. 이유: step 8의 범위다. 여기서는 빈 상태까지.
 - 세션 검사를 클라이언트 컴포넌트에서만 하지 마라. 이유: 우회 가능하다. 미들웨어 + 서버 레이아웃 양쪽에서 막는다.
+- **`DELETE /api/account`에서 요청이 준 user id를 쓰지 마라.** 이유: service role 라우트라 그 순간 임의 계정 삭제 도구가 된다. 세션에서만 읽는다.
+- 가입 실패 사유로 계정 존재 여부를 노출하지 마라. 이유: 이메일 열거 취약점이다.
+- `profiles`를 클라이언트에서 UPDATE 하는 코드를 쓰지 마라. 이유: step 3에서 정책 자체를 만들지 않았고, 만들면 `plan` 컬럼이 열린다(ADR-012).
 - 기존 테스트를 깨뜨리지 마라.

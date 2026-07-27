@@ -61,3 +61,9 @@ MVP 속도 최우선. 외부 의존성 최소화. 작동하는 최소 구현을 
 **결정**: `classifyMerchants`와 `generateInsights`는 둘 다 업로드 2단계(`POST /api/statements/[id]/classify`)에서만 호출한다. Server Component와 컴포넌트는 `transactions.category`와 `insights` 테이블을 **읽기만** 한다.
 **이유**: LLM 호출은 10~30초다. Server Component 렌더 안에서 부르면 그 시간만큼 페이지 응답이 통째로 막히고, 실패하면 대시보드 전체가 죽는다. 캐시 미스가 나는 첫 방문이 가장 느린 방문이 되는 것도 거꾸로다 — 첫인상이 가장 중요한 순간인데.
 **트레이드오프**: 인사이트가 아직 없는 구간이 생긴다. 그때는 `"인사이트를 준비하고 있습니다."` + 생성 버튼을 렌더한다. 조회 경로에 LLM이 없다는 규칙은 지키기 쉽고 `grep`으로 검증된다.
+
+### ADR-012: 권한 상승이 가능한 값은 사용자 쓰기 경로에서 분리한다
+**결정**: `profiles.plan`과 `subscriptions.*`에는 사용자 UPDATE 정책을 만들지 않는다. 결제 대상 user id는 서버 세션에서만 읽고, 쿼리 파라미터로 들어온 값은 세션과 대조해 다르면 거부한다.
+**이유**: RLS는 행 단위 정책이라 UPDATE를 허용하면 그 행의 모든 컬럼이 열린다. `profiles`에 통상적인 `auth.uid() = id` UPDATE 정책을 붙이면 브라우저에서 `update({ plan: 'pro' })` 한 줄로 결제를 우회할 수 있다. 같은 이유로 Polar 체크아웃의 `customerExternalId`를 클라이언트가 정하게 두면, 남의 계정에 내 구독을 연결해 그 사람의 플랜을 좌우할 수 있다.
+**트레이드오프**: 나중에 `profiles`에 사용자가 편집할 컬럼(닉네임 등)이 생기면 정책 대신 컬럼 단위 권한(`grant update (col) on profiles to authenticated`)을 써야 한다. 행 정책 하나로 끝내는 것보다 번거롭지만, 권한 컬럼과 프로필 컬럼이 한 테이블에 있는 한 이게 유일하게 안전한 방법이다.
+

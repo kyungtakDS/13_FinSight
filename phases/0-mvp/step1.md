@@ -31,6 +31,7 @@ export interface Transaction {
   amount: number;         // 지출은 양수, 입금/환불은 음수
   category: Category | null;
   categorySource: "llm" | "user" | null;
+  isTransfer: boolean;    // 계좌이체·입출금 행. 적요에 실명이 들어가므로 LLM에 보내지 않는다
   raw: Record<string, string>;   // 원본 CSV 행 그대로
 }
 
