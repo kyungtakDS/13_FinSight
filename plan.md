@@ -94,6 +94,8 @@
 
 **`profiles`·`subscriptions`에는 사용자 쓰기 정책이 없다.** RLS는 행 단위라 UPDATE를 열면 `plan` 컬럼까지 열리고, 브라우저에서 `update({plan:'pro'})` 한 줄로 결제가 우회된다.
 
+`statements`에는 분류 중복 실행을 막기 위한 `classification_status`와 `classified_at`을 둔다. 이는 분석 파생값 저장이 아니라 외부 LLM 작업의 실행 상태다.
+
 ---
 
 ## 5. 데이터 흐름
@@ -124,7 +126,7 @@
 | 반복 결제 · 이상 거래 | **코드** | 규칙·통계가 더 정확하고 공짜 |
 | 요약 · 절약 제안 | **LLM** | 집계 결과를 *입력으로 받아* 서술 |
 
-LLM 호출은 명세서당 **딱 2번**이고, 둘 다 쓰기 경로에서만 일어난다.
+LLM 호출은 명세서당 **최대 2번**이고, 둘 다 쓰기 경로에서만 일어난다. 동일 명세서의 동시·반복 classify는 상태 전이로 한 번만 실행되게 한다.
 
 ---
 
@@ -155,15 +157,15 @@ LLM 호출은 명세서당 **딱 2번**이고, 둘 다 쓰기 경로에서만 �
 | 0 | `project-setup` | package.json → 의존성 → 설정 → `lib/format.ts` | ⚠ **package.json이 최우선.** Stop 훅이 매 세션 `lint && build && test`를 돌린다. `create-next-app` 금지 |
 | 1 | `core-types` | `src/types/` 전체 | types/는 TDD 면제 — 로직 금지 |
 | 2 | `csv-parser` | `parseStatementCsv`, `normalizeMerchant`, 마스킹, 지문 | 지문에 `occurrence` 필수(정상 중복 보존) |
-| 3 | `supabase-schema` | 마이그레이션 3종 + 클라이언트 3종 + `plan.ts` | AC: RLS 5테이블 grep |
+| 3 | `supabase-schema` | 마이그레이션 4종 + 클라이언트 3종 + `plan.ts` | AC: RLS 5테이블 grep, 분류 상태 필드 |
 | 4 | `auth-flow` | 로그인·가입·콜백·미인증 안내·비밀번호 재설정·계정 삭제 | 계정 삭제는 세션 id만 사용 |
 | 5 | `analytics-engine` | 순수 함수 6종 | KST 버킷팅, MAD z>3.5, 탐지는 전체 이력 |
 | 6 | `anthropic-service` | `classifyMerchants` / `generateInsights` | `max_tokens: 16000`, `temperature` 금지 |
-| 7 | `statements-api` | `ingest.ts` + `classify.ts` + 라우트 5개 | 1단계에 LLM 금지, 1000행 청크 |
+| 7 | `statements-api` | `ingest.ts` + `classify.ts` + 라우트 5개 | 1단계에 LLM 금지, 1000행 청크, 단기 남용 방지, 인사이트 무효화 |
 | 8 | `dashboard-ui` | Server Component + 컴포넌트 15종 | LLM 호출 0건, 상태 매트릭스 전 칸 처리 |
 | 9 | `billing` | Polar 라우트 4개 + `syncSubscription` | checkout 세션 검증, 웹훅 순서 가드 |
 | 10 | `landing-page` | 랜딩 + 요금제 + `/help/csv` | 안티패턴 금지, 한계 명시 |
-| 11 | `deploy-prep` | README · SECURITY · 샘플 CSV · E2E | 실제 배포 시도 금지 |
+| 11 | `deploy-prep` | README · DEPLOY_CHECKLIST · SECURITY · 샘플 CSV | 실제 배포 시도 금지 |
 
 각 step 파일은 자기완결적이다 — 읽어야 할 파일, 시그니처 수준 지시, 실행 가능한 AC 커맨드, "X를 하지 마라 / 이유: Y" 형식의 금지사항을 갖는다.
 
@@ -189,8 +191,9 @@ harness 문서의 `python3`는 이 머신에서 동작하지 않는다(PATH에 p
 
 step을 순차 실행하며 step 단위로 커밋하고, 실패 시 최대 3회 자가 교정한다.
 
-**키 없이 완주 가능:** step 0 · 1 · 2 · 5 · 6 · 10
-**키가 필요해 `blocked`로 멈추는 step:** 3 · 4 · 7 · 8 · 9 · 11
+**모든 step은 키 없이 코드·모킹 테스트까지 완주한다.** 환경변수는 함수 내부에서 지연 검증하고 외부 서비스 호출은 모킹한다. 실제 Supabase/Anthropic/Polar 연결과 배포 확인은 step 11의 수동 배포 체크리스트에 `미검증`으로 남긴다. 외부 자격증명 부재만으로 step을 `blocked` 처리하지 않는다.
+
+`blocked`는 코드·로컬 테스트 자체를 계속할 수 없는 사용자 결정이나 로컬 의존성 부재에만 사용한다. 수동 통합 검증은 실행 흐름을 중단시키지 않는다.
 
 | 환경변수 | 출처 |
 |---|---|
@@ -223,7 +226,7 @@ step을 순차 실행하며 step 단위로 커밋하고, 실패 시 최대 3회 
 할부 이중 계상 가능성 · 부분취소 자동 상계 안 함 · 여러 파일이 한 대시보드에 합쳐짐
 
 **운영**
-레이트 리밋(공개 전 추가) · 장기 미접속 데이터 자동 정리
+장기 미접속 데이터 자동 정리
 
 가장 먼저 후회할 항목은 **이상 거래 무시 처리**다. MAD 임계값(3.5)이 실제 데이터에서 얼마나 잡는지 보고 판단한다.
 

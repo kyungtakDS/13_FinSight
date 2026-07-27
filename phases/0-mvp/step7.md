@@ -120,6 +120,7 @@ export async function classifyStatement(args: {
 - 유효하지 않은 카테고리면 `400` + `"올바르지 않은 카테고리입니다."`
 - **`applyToMerchant`가 true면(기본값) 같은 `merchant`의 모든 거래를 `category_source: "user"`로 함께 UPDATE 한다** (DE-06). 이렇게 하면 다음 달 업로드에서 파생 맵이 자동으로 이 값을 물려받는다 — 따로 저장할 곳이 필요 없다.
   이유: 한 건만 고치면 같은 가맹점 수십 건이 그대로 남아 사용자가 같은 수정을 반복하게 되고, 다음 달에 또 틀린다. 응답에 반영된 건수를 실어 보내라 — 화면에서 `"스타벅스 42건을 식비로 바꿨습니다."`를 보여줄 수 있어야 한다.
+- 카테고리 UPDATE와 같은 서버 작업에서 이 사용자의 `insights` 행을 DELETE한다. 인사이트는 변경 전 카테고리 집계를 입력으로 만든 캐시이므로 그대로 두면 오래된 절약 제안을 현재 결과처럼 보여주게 된다.
 
 ### 6. `src/app/api/statements/[id]/route.ts` (**`route.test.ts` 먼저**)
 
@@ -129,7 +130,8 @@ export async function classifyStatement(args: {
 
 - 세션 검증 + 소유권 확인(RLS가 막지만 404를 주기 위해 명시적으로도)
 - 응답에 삭제된 거래 수를 실어 `"명세서와 거래 234건을 삭제했습니다."`를 보여줄 수 있게 한다
-- 삭제 후 추가 정리 작업은 **없다.** 반복 결제·이상 거래·가맹점 맵이 전부 `transactions`에서 조회 시점에 파생되므로 자동으로 맞는다. 파생값을 저장하지 않기로 한 설계의 이득이다.
+- 명세서 삭제와 같은 서버 작업에서 이 사용자의 `insights` 행도 DELETE한다. 반복 결제·이상 거래·가맹점 맵은 조회 시점에 자동으로 다시 맞지만, 외부 호출 결과인 인사이트는 명시적으로 무효화해야 한다.
+- 명세서 삭제와 인사이트 무효화는 **step 3의 `0004_functions.sql`이 만든 `delete_statement()` RPC**로 처리한다. supabase-js는 여러 문장을 한 트랜잭션으로 묶지 못하므로, 두 번 호출하면 둘 중 하나만 성공해 오래된 인사이트가 남을 수 있다. 카테고리 일괄 수정도 같은 이유로 `set_merchant_category()` RPC를 쓴다.
 
 ### 7. `src/app/api/export/route.ts` (**`route.test.ts` 먼저**)
 
@@ -153,9 +155,24 @@ function csvCell(v: string): string {
 
 ### 8. 업로드 제한
 
-**횟수 제한도, 레이트 리밋도 만들지 마라** (ADR-006). Free/Pro 모두 업로드 무제한이고, 플랜은 조회 범위와 기능으로만 갈린다.
+**요금제의 월간 횟수 제한은 만들지 않되 운영 레이트 리밋은 둔다** (ADR-006). 인증 사용자별로 최근 1시간의 `statements.created_at`을 세어 업로드가 20건을 넘으면 `429`와 `Retry-After`를 반환한다. 이는 정상적인 월별 사용을 제한하는 상품 기능이 아니라 비용 공격과 실수성 반복 요청을 막는 안전장치다.
 
-남용 방지 상한은 **공개 배포 전 과제**로 미룬다. 지금은 사용자가 몇 명뿐이고, LLM 비용의 실질 상한은 Anthropic 콘솔의 지출 한도가 잡아준다. 카운팅 쿼리와 임계값 튜닝을 지금 넣으면 정상 사용자를 잠글 위험만 생긴다. `docs/SECURITY.md`에 "공개 전 추가할 것"으로 한 줄 남긴다.
+classify 시작 시 해당 statement의 `classification_status`를 조건부 UPDATE해 요청 하나만 진행시킨다. 종료 시 `completed`와 `classified_at`, 실패 시 `failed`를 기록한다. 이 상태 전이는 테스트 가능한 별도 함수로 분리한다.
+
+**진입 조건에 stale 회수를 반드시 넣어라:**
+
+```sql
+update statements
+   set classification_status = 'processing', classification_started_at = now()
+ where id = $1
+   and (classification_status in ('pending','failed')
+        or (classification_status = 'processing'
+            and classification_started_at < now() - interval '10 minutes'))
+```
+
+`pending`/`failed`만 허용하면 **함수가 분류 도중 죽었을 때 상태가 `processing`에 영구히 남는다.** 그러면 "다시 분류하기"가 계속 `409`를 반환해 DE-05(분류 실패 복구)를 위해 만든 경로가 그 자체로 막혀버린다. `maxDuration`이 120초이므로 10분이면 정상 실행과 겹칠 여지가 없다.
+
+UPDATE가 0행이면 현재 상태를 다시 읽어 `processing`이면 `409` + `"분류가 이미 진행 중입니다."`, `completed`면 저장된 결과로 성공 응답을 돌려 LLM을 다시 호출하지 않는다.
 
 ### 테스트에 반드시 포함할 케이스
 
@@ -169,6 +186,10 @@ function csvCell(v: string): string {
 - **`classifyStatement`를 두 번 호출해도 결과가 같은지** (멱등성)
 - **분류가 실패해도 이미 저장된 거래가 남아 있는지** (롤백하지 않음)
 - **인사이트 생성이 실패해도 분류·반복결제 결과가 유지되고 `insightsGenerated: false`가 반환되는지**
+- 카테고리 수정·명세서 삭제 시 기존 인사이트가 함께 무효화되는지
+- 1시간 내 21번째 업로드가 `429`와 `Retry-After`를 반환하는지
+- 동일 statement에 동시 classify 요청을 보내도 LLM이 한 번만 호출되는지
+- **`processing`으로 10분 넘게 멈춰 있던 statement가 다시 분류 가능한지** (stale 회수 — 없으면 복구 경로가 영구히 막힌다)
 - **plan이 `free`면 `generateInsights`가 호출되지 않는지**
 - **`isTransfer: true`인 거래의 `merchant`가 `classifyMerchants`에 넘어가지 않는지** (개인정보 — 반드시 단언하라)
 - **5만 행 입력이 1,000행 단위로 나뉘어 전송되는지** (호출 횟수 단언)
@@ -200,11 +221,11 @@ npm run test
 3. 결과에 따라 `phases/0-mvp/index.json`의 step 7을 업데이트한다:
    - 성공 → `"status": "completed"`, `"summary"`에 라우트 경로와 `ingestStatement` 시그니처 요약
    - 3회 시도 후 실패 → `"status": "error"` + `"error_message"`
-   - 사용자 개입 필요 → `"status": "blocked"` + `"blocked_reason"` 후 즉시 중단
+   - 외부 자격증명·대시보드 설정이 필요한 검증은 루트 `DEPLOY_CHECKLIST.md`에 `- [ ] (미검증)`으로 append 하고 step은 `"completed"`로 처리한다. 코드·로컬 테스트 자체를 진행할 수 없는 경우에만 `"status": "blocked"` + `"blocked_reason"` 후 중단한다.
 
 ## 금지사항
 
-- 업로드/분석 **횟수 제한을 넣지 마라**. 이유: 명세서는 월 1회 나온다. 횟수 제한은 제품을 안 쓰게 만들 뿐이다(ADR-006).
+- 월간 업로드/분석 횟수로 플랜을 나누지 마라. 단, ADR-006의 단기 남용 방지 제한과 동일 명세서 중복 분류 방지는 반드시 구현한다.
 - 내부 예외 메시지나 스택 트레이스를 클라이언트 응답에 넣지 마라. 이유: DB 구조와 키 정보가 새어나간다.
 - 원본 CSV 파일을 스토리지에 업로드하지 마라. 이유: `transactions.raw`에 행 단위로 보관하면 충분하고, 파일 스토리지는 추가 유출 경로다.
 - 라우트 핸들러 안에서 Supabase 클라이언트를 새로 만들지 마라. 이유: `lib/supabase/server.ts`가 쿠키 처리를 이미 한다.

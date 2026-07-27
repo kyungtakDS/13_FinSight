@@ -127,7 +127,7 @@ npm run test
 3. 결과에 따라 `phases/0-mvp/index.json`의 step 5를 업데이트한다:
    - 성공 → `"status": "completed"`, `"summary"`에 5개 함수 시그니처와 파일 경로 요약
    - 3회 시도 후 실패 → `"status": "error"` + `"error_message"`
-   - 사용자 개입 필요 → `"status": "blocked"` + `"blocked_reason"` 후 즉시 중단
+   - 외부 자격증명·대시보드 설정이 필요한 검증은 루트 `DEPLOY_CHECKLIST.md`에 `- [ ] (미검증)`으로 append 하고 step은 `"completed"`로 처리한다. 코드·로컬 테스트 자체를 진행할 수 없는 경우에만 `"status": "blocked"` + `"blocked_reason"` 후 중단한다.
 
 ## 금지사항
 

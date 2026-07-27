@@ -83,14 +83,15 @@ LLM 호출은 두 번뿐이고 **둘 다 업로드 2단계에서만 일어난다
 
 [대시보드 조회]  ── LLM을 부르지 않는다 (ADR-011)
 /dashboard (Server Component)
-  → transactions 조회. 보관 기간 필터는 쿼리에 건다 (.gte("txn_date", cutoff))
-  → lib/analytics(TS 순수 함수)로 집계: 카테고리별 / 기간별 / 전월 대비
+  → transactions 전체 이력을 사용자 범위로 1회 조회
+  → applyRetention으로 표시용 거래를 분리
+  → 표시용 거래를 lib/analytics(TS 순수 함수)로 집계: 카테고리별 / 기간별 / 전월 대비
   → 탐지(반복결제·이상거래)는 보관 기간 필터 없이 전체 이력으로 계산 (ADR-010 따름정리)
   → insights 테이블에서 캐시를 읽기만 한다. 없으면 "준비 중" + 생성 버튼
   → 차트 + 카드 렌더
 ```
 
-집계는 **TS 순수 함수**가 한다(SQL 뷰나 RPC를 만들지 않는다). 조회한 거래 배열을 `src/lib/analytics/`에 넘기는 방식이라 테스트가 빠르고 결정론적이다. 보관 기간이 조회 범위를 제한하므로 메모리에 올라오는 행 수도 유계다. 이력이 커져 이 방식이 버거워지면 그때 SQL 집계로 옮긴다 — MVP 범위에서는 필요 없다.
+집계는 **TS 순수 함수**가 한다(SQL 뷰나 RPC를 만들지 않는다). 탐지에는 전체 이력이 필요하므로 사용자 거래를 한 번 조회하고, 표시용 데이터만 `applyRetention`으로 나눈다. 조회 쿼리와 TS에 보관 규칙을 중복 구현하지 않는다. 이력이 커져 이 방식이 버거워지면 그때 SQL 집계로 옮긴다 — MVP 범위에서는 필요 없다.
 
 ## 플랜 게이팅
 
@@ -101,9 +102,9 @@ canAccess(plan: Plan, feature: Feature): boolean
 retentionCutoff(plan: Plan): Date | null   // free → 90일 전, pro → null
 ```
 
-Free 사용자의 조회 쿼리에는 `txn_date >= retentionCutoff(plan)` 필터가 붙는다. **데이터는 지우지 않는다** — 가려질 뿐이고 업그레이드하면 즉시 보인다.
+Free 사용자의 표시용 거래에는 `applyRetention`이 `retentionCutoff(plan)`을 적용한다. DB 조회에는 날짜 필터를 걸지 않는다. **데이터는 지우지 않는다** — 가려질 뿐이고 업그레이드하면 즉시 보인다.
 
-게이팅은 **목록 단위**다(ADR-010). 구독 탐지·이상 거래는 Free에서도 **건수와 총액을 계산해 보여주고**, 세부 목록만 잠근다. 실제로 계산한 값이므로 가짜 데이터가 아니다. AI 인사이트는 전체가 Pro다.
+게이팅은 **목록 단위**다(ADR-010). `recurring_summary`와 `anomaly_summary`는 Free에도 허용하고, `recurring_details`와 `anomaly_details`만 Pro로 제한한다. 실제 계산한 건수와 총액을 Free에도 보여주며 AI 인사이트는 전체가 Pro다.
 
 ## 패턴
 - Server Components 기본. 인터랙션(업로드, 카테고리 수정, 차트 툴팁)이 필요한 곳만 Client Component.

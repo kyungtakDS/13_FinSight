@@ -23,7 +23,11 @@ SQL 마이그레이션과 Supabase 클라이언트 헬퍼를 만든다. **이 st
 - 모든 테이블에 `id uuid primary key default gen_random_uuid()`, `created_at timestamptz not null default now()`
 - `profiles.id`는 `references auth.users(id) on delete cascade`, `plan text not null default 'free' check (plan in ('free','pro'))`
 - 그 외 모든 테이블에 `user_id uuid not null references auth.users(id) on delete cascade`
-- `transactions`: `statement_id uuid not null references statements(id) on delete cascade`, `txn_date date not null`, `description text not null`, `merchant text not null`, **`amount numeric(14,0) not null`**, `category text`, `category_source text check (category_source in ('llm','user'))`, `raw jsonb not null`, `fingerprint text not null`
+- `statements`: 기존 필드에 `created_at timestamptz not null default now()`, `classification_status text not null default 'pending' check (classification_status in ('pending','processing','completed','failed'))`, `classification_started_at timestamptz`, `classified_at timestamptz`
+  - **`classification_started_at`이 반드시 필요하다.** step 7이 `processing`으로 조건부 전이해 동시 실행을 막는데, 함수가 중간에 죽으면 상태가 `processing`에 영구히 남는다. 그러면 "다시 분류하기"가 계속 `409`를 반환해 **DE-05(분류 실패 복구) 경로 자체가 막힌다.** 시작 시각을 남겨야 오래된 `processing`을 회수할 수 있다.
+  - 인덱스: `statements(user_id, created_at desc)` — 목록 조회와 레이트 리밋 카운트가 쓴다.
+- `transactions`: `statement_id uuid not null references statements(id) on delete cascade`, `txn_date date not null`, `description text not null`, `merchant text not null`, **`amount numeric(14,0) not null`**, `category text`, `category_source text check (category_source in ('llm','user'))`, **`is_transfer boolean not null default false`**, `raw jsonb not null`, `fingerprint text not null`
+  - **`is_transfer`를 빠뜨리지 마라.** step 1의 `ParsedTransaction.isTransfer`, step 2의 `isTransferRow()`, step 7의 `where ... and is_transfer = false` 가 전부 이 컬럼을 전제한다. 없으면 이체 행이 LLM 분류 입력에서 걸러지지 않고 **제3자의 실명이 외부 API로 나간다**(CLAUDE.md CRITICAL).
   - **소수점 자리를 두지 마라.** 원화에 소수점이 없고, `docs/ADR.md`와 step 5가 "정수 원 단위로 다룬다"를 전제한다. `numeric(14,2)`로 두면 반올림 오차가 들어올 자리를 만드는 셈이다.
   - **`category_source`의 의미를 정확히 지켜라:** `'user'`는 사용자가 직접 지정했다는 뜻이고 **재분류가 절대 덮어써서는 안 되는 표시**다. `'llm'`은 자동 분류된 값이라 갱신해도 된다. 가맹점→카테고리 맵도 이 컬럼으로 파생한다(step 7).
 - **`unique (user_id, fingerprint)`** — 같은 명세서를 두 번 올려도 중복되지 않게
@@ -59,6 +63,22 @@ SQL 마이그레이션과 Supabase 클라이언트 헬퍼를 만든다. **이 st
 
 `auth.users`에 행이 생기면 `profiles`에 `plan='free'`로 자동 삽입하는 트리거(`security definer`).
 
+### 3-1. `supabase/migrations/0004_functions.sql`
+
+step 7이 원자적으로 처리해야 하는 두 작업을 Postgres 함수로 만든다. **supabase-js는 여러 문장을 한 트랜잭션으로 묶지 못하므로 RPC가 아니면 원자성을 얻을 수 없다.** step 7은 SQL 마이그레이션을 만들지 않으니 여기서 준비한다.
+
+```sql
+-- 명세서 삭제 + 인사이트 무효화를 한 트랜잭션에서
+create function delete_statement(p_statement_id uuid) returns int ...
+-- 거래는 cascade로 지워지고, 같은 트랜잭션에서 이 사용자의 insights 행을 삭제한다.
+-- 삭제된 거래 수를 반환한다.
+
+-- 카테고리 일괄 수정 + 인사이트 무효화
+create function set_merchant_category(p_merchant text, p_category text) returns int ...
+```
+
+두 함수 모두 `security invoker`로 두어 **RLS가 그대로 적용되게 한다** — `security definer`로 만들면 남의 행도 지울 수 있는 구멍이 된다. 대상 `user_id`는 인자로 받지 말고 함수 안에서 `auth.uid()`를 쓴다.
+
 ### 4. Supabase 클라이언트 3종
 
 - `src/lib/supabase/client.ts` — 브라우저용, `createBrowserClient` (anon key)
@@ -83,7 +103,7 @@ export function retentionCutoff(plan: Plan, now?: Date): Date | null;  // free �
 
 컷오프 날짜는 **KST 기준**으로 계산한다(step 0의 `toKstDateString`). 조회 쿼리에 `.gte("txn_date", …)`로 들어가는 값이라 하루가 밀리면 경계일 거래가 통째로 사라진다.
 
-`docs/PRD.md`의 요금제 표가 사양이다. Free에 허용되는 것은 카테고리 분류와 최근 3개월 추이뿐이고, `recurring_detection` / `anomaly_detection` / `ai_insights` / `csv_export` / `unlimited_history`는 Pro 전용이다.
+`docs/PRD.md`의 요금제 표가 사양이다. Free에도 `recurring_summary` / `anomaly_summary` 계산과 표시를 허용한다. `recurring_details` / `anomaly_details` / `ai_insights` / `csv_export` / `unlimited_history`만 Pro 전용이다. 탐지 전체를 하나의 기능 플래그로 잠그지 마라.
 
 ## Acceptance Criteria
 
@@ -106,7 +126,7 @@ grep -c "enable row level security" supabase/migrations/0002_rls.sql   # 5 이�
 3. 결과에 따라 `phases/0-mvp/index.json`의 step 3을 업데이트한다:
    - 성공 → `"status": "completed"`, `"summary"`에 생성한 마이그레이션 파일명과 클라이언트 3종 경로, `canAccess`/`retentionCutoff` 시그니처 요약
    - 3회 시도 후 실패 → `"status": "error"` + `"error_message"`
-   - 사용자 개입 필요 → `"status": "blocked"` + `"blocked_reason"` 후 즉시 중단
+   - 외부 자격증명·대시보드 설정이 필요한 검증은 루트 `DEPLOY_CHECKLIST.md`에 `- [ ] (미검증)`으로 append 하고 step은 `"completed"`로 처리한다. 코드·로컬 테스트 자체를 진행할 수 없는 경우에만 `"status": "blocked"` + `"blocked_reason"` 후 중단한다.
 
 ## 금지사항
 

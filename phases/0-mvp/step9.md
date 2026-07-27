@@ -151,7 +151,8 @@ npm run test
 3. 결과에 따라 `phases/0-mvp/index.json`의 step 9를 업데이트한다:
    - 성공 → `"status": "completed"`, `"summary"`에 세 라우트 경로와 `syncSubscription` 시그니처 요약
    - 3회 시도 후 실패 → `"status": "error"` + `"error_message"`
-   - **Polar 대시보드에서 상품·웹훅을 만들어야 하는 등 실제 자격증명이 필요하면** → `"status": "blocked"`, `"blocked_reason"`에 필요한 환경변수 이름을 적고 즉시 중단. 코드 작성과 모킹 테스트까지는 키 없이 끝낼 수 있으니, 그것까지 마친 뒤 판단하라.
+   - Polar 상품·웹훅 생성처럼 실제 자격증명이 필요한 검증은 **레포 루트의 `DEPLOY_CHECKLIST.md`**에 `- [ ] (미검증)` 항목으로 append 하고(파일이 없으면 만든다), 코드 작성과 모킹 테스트가 통과하면 step은 `"completed"`로 처리한다. 외부 검증 미실행만으로 `"blocked"` 처리하지 마라.
+     `docs/` 아래에 두지 마라 — `execute.py:184`가 `docs/*.md`를 12개 step 프롬프트마다 주입한다. 검증 항목이 쌓이는 파일이라 주입 대상이 되면 안 된다.
 
 ## 금지사항
 

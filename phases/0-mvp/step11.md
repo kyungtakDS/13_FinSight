@@ -37,7 +37,7 @@ npm run dev
 
 **Supabase 설정 절차**
 1. 프로젝트 생성
-2. `supabase/migrations/` 의 SQL을 순서대로 실행 (`0001` → `0002` → `0003`). SQL Editor 붙여넣기 또는 `supabase db push`.
+2. `supabase/migrations/` 의 SQL을 순서대로 실행 (`0001` → `0002` → `0003` → `0004`). SQL Editor 붙여넣기 또는 `supabase db push`.
 3. Authentication → Email 공급자 활성화, `Site URL`과 `Redirect URLs`에 `/auth/callback` 등록
 4. **RLS 확인:** Table Editor에서 5개 테이블 모두 RLS가 켜져 있는지 눈으로 확인. 꺼져 있으면 배포하지 마라.
 5. Authentication → Email Templates에서 **비밀번호 재설정 메일**이 활성화돼 있는지 확인. `Redirect URLs`에 `/auth/reset/confirm`도 등록한다.
@@ -47,7 +47,7 @@ npm run dev
 2. Pro 상품 생성 → 상품 ID를 `POLAR_PRODUCT_ID_PRO`에
 3. Organization Access Token 발급 → `POLAR_ACCESS_TOKEN`
 4. 웹훅 엔드포인트 등록: `https://<도메인>/api/webhook/polar`, 시크릿을 `POLAR_WEBHOOK_SECRET`에
-5. 구독하는 이벤트: `subscription.active`, `subscription.updated`, `subscription.canceled`, `subscription.revoked`
+5. 구독하는 이벤트: `subscription.active`, `subscription.updated`, `subscription.canceled`, `subscription.uncanceled`, `subscription.revoked`
 6. 검증 후 production 조직으로 같은 절차 반복
 
 **Vercel 배포 절차**
@@ -80,7 +80,7 @@ npm run dev
 
 복구 경로
 - [ ] 비밀번호 재설정 메일 → 링크 → 새 비밀번호 → 로그인
-- [ ] 잘못 올린 명세서 삭제 → 거래가 함께 사라지고 반복 결제가 재계산되는지
+- [ ] 잘못 올린 명세서 삭제 → 거래가 함께 사라지고 인사이트가 무효화되는지
 - [ ] KST 매월 1일 오전 거래가 들어간 파일 → 월 합계가 그 달로 잡히는지
 - [ ] 미인증 상태로 로그인 시도 → **자격 실패가 아니라** 인증 안내 화면이 뜨는지
 - [ ] 컬럼명이 다른 CSV 업로드 → 에러에 **감지된 헤더가 실려 있고** 도움말 링크가 있는지
@@ -100,7 +100,15 @@ npm run dev
 
 같은 내용을 `/help/csv`에도 적는다. 모르고 빠진 것과 알고 넘어간 것은 다르고, 사용자가 숫자를 검증하다 이 차이를 먼저 발견하면 신뢰를 잃는다.
 
-### 2. `docs/SECURITY.md`
+### 2. `DEPLOY_CHECKLIST.md` (레포 루트)
+
+앞선 step들이 자격증명이 없어 미룬 수동 검증 항목이 `- [ ] (미검증)` 형태로 쌓여 있다. **이 파일을 정리해 완성한다** — 없으면 새로 만든다.
+
+- 위 "엔드투엔드 확인 체크리스트"를 이 파일로 옮기고, README에서는 이 파일을 링크한다
+- 앞선 step이 남긴 미검증 항목을 Supabase / Polar / Vercel 섹션으로 분류한다
+- **`docs/` 아래에 두지 마라.** `execute.py:184`가 `docs/*.md`를 12개 step 프롬프트마다 주입하므로, 항목이 쌓이는 문서를 거기 두면 모든 step의 토큰이 는다.
+
+### 3. `docs/SECURITY.md`
 
 짧게. 무엇을 저장하고 무엇을 저장하지 않는지, 어디로 데이터가 나가는지.
 - 저장: 거래 원본 행, 마스킹된 적요, 카테고리, 집계 결과, 구독 상태
@@ -108,15 +116,15 @@ npm run dev
 - 외부 전송: 가맹점명(유니크 목록)과 집계 결과가 Anthropic Claude API로 전송됨. 개별 거래 원문은 전송하지 않음. 이미 분류된 가맹점은 다시 전송하지 않음. **계좌이체 거래는 적요에 실명이 들어가므로 전송 대상에서 제외됨.**
 - 격리: 모든 테이블 RLS. **플랜·구독 컬럼은 사용자 쓰기 불가** — 웹훅이 service role로만 갱신
 - 삭제: 설정 화면의 계정 삭제로 사용자가 직접 전 데이터를 지울 수 있음. 명세서 단위 삭제도 가능
-- **공개 전 추가할 것**: 업로드·분류 엔드포인트 레이트 리밋. MVP 단계에서는 Anthropic 콘솔의 지출 한도로 갈음한다
+- 남용 방지: 사용자당 시간당 업로드 20건 제한, 동일 명세서 중복 분류 차단(ADR-006 운영 가드레일). LLM 비용의 최종 상한은 Anthropic 콘솔의 지출 한도로 별도 설정한다
 
 랜딩의 개인정보 문단도 이 범위와 일치시켜라. "가맹점명이 전송됩니다"만 쓰면 사용자는 그것을 "내가 송금한 사람 이름"으로 읽지 않는다 — 이체 행을 제외한다는 사실을 함께 적는다.
 
-### 3. `sample/` 샘플 CSV
+### 4. `sample/` 샘플 CSV
 
 테스트용 CSV 2개를 넣는다. `sample/card-utf8.csv`(UTF-8), `sample/card-cp949.csv`(CP949). 각 30행 내외, 가맹점명은 실존하지 않는 가상의 이름으로. 실제 개인 데이터를 넣지 마라.
 
-### 4. 최종 점검
+### 5. 최종 점검
 
 - `.env.example`과 README 환경변수 표의 항목이 일치하는지
 - `docs/`와 `CLAUDE.md`에 `{...}` 플레이스홀더가 남아 있지 않은지
@@ -128,7 +136,7 @@ npm run dev
 npm run lint
 npm run build
 npm run test
-test -f README.md && test -f docs/SECURITY.md
+test -f README.md && test -f docs/SECURITY.md && test -f DEPLOY_CHECKLIST.md
 grep -q "SUPABASE_SERVICE_ROLE_KEY" README.md
 ! grep -rn "{프로젝트명}\|{기능 1}\|{결정 사항}" CLAUDE.md docs/
 ```
@@ -142,9 +150,9 @@ grep -q "SUPABASE_SERVICE_ROLE_KEY" README.md
    - 샘플 CSV에 실제 개인정보가 없는가?
    - 커밋된 시크릿이 없는가?
 3. 결과에 따라 `phases/0-mvp/index.json`의 step 11을 업데이트한다:
-   - 성공 → `"status": "completed"`, `"summary"`에 README·SECURITY·sample 경로 요약
+   - 성공 → `"status": "completed"`, `"summary"`에 README·DEPLOY_CHECKLIST·SECURITY·sample 경로 요약
    - 3회 시도 후 실패 → `"status": "error"` + `"error_message"`
-   - 사용자 개입 필요 → `"status": "blocked"` + `"blocked_reason"` 후 즉시 중단
+   - 실제 배포·대시보드 설정처럼 사용자 승인이 필요한 항목은 루트 `DEPLOY_CHECKLIST.md`에 `미검증`으로 남긴다. 문서·코드·로컬 검증이 완료됐으면 step은 `"completed"`로 처리하며, 외부 검증 미실행만으로 `"blocked"` 처리하지 않는다.
 
 ## 금지사항
 
