@@ -4,7 +4,7 @@
 
 - `/CLAUDE.md` — 서버 사이드 규칙, TDD Guard가 `route.ts`를 면제하지 않는다는 점
 - `/docs/ARCHITECTURE.md` — 데이터 흐름의 `[업로드]` 구간이 이 step의 사양이다
-- `/docs/ADR.md` — ADR-008(2단계 분리), ADR-009(가맹점 맵)
+- `/docs/ADR.md` — ADR-008(2단계 분리), ADR-009(파생 맵), ADR-013(파생값 비저장)
 - `phases/0-mvp/USER_JOURNEY.md` — **6장 "업로드 상태 머신"의 상태별 문구 표가 응답 메시지의 사양이다**
 - `src/lib/csv.ts`, `src/lib/dedupe.ts` (step 2)
 - `src/lib/supabase/server.ts`, `src/lib/plan.ts` (step 3)
@@ -26,7 +26,7 @@ export interface IngestResult {
   insertedCount: number;
   duplicateCount: number;
   skippedRows: { rowNumber: number; reason: string }[];
-  knownMerchantCount: number;    // 맵에서 바로 분류된 수
+  knownMerchantCount: number;    // 과거 거래에서 파생한 맵으로 바로 분류된 수
   unknownMerchantCount: number;  // 2단계에서 LLM에 물어야 할 수
 }
 
@@ -45,7 +45,17 @@ export async function ingestStatement(args: {
    - **1,000행 단위로 나눠 보내라.** step 2가 상한을 50,000행으로 잡았는데 한 번에 보내면 `raw` jsonb까지 포함된 요청 바디가 PostgREST 한도를 넘는다. supabase-js는 자동 분할하지 않는다. 자기 사양의 상한에서 죽는 코드를 만들지 마라.
    - 삽입된 행 수는 `.select("id")`를 체이닝해 반환된 행 수로 센다(`ignoreDuplicates`는 중복 행을 반환하지 않는다). 중복 수 = 보낸 수 − 삽입된 수.
    - 청크 진행 상황을 셀 수 있으므로 1단계 응답 품질도 같이 올라간다.
-4. **`merchant_categories`에서 이 사용자의 맵을 읽어 아는 가맹점의 `category`를 즉시 채운다** (`category_source`는 맵의 `source`를 따른다). **여기서 LLM을 호출하지 마라.**
+4. **이미 분류된 과거 거래에서 가맹점→카테고리 맵을 만들어** 아는 가맹점의 `category`를 즉시 채운다. **여기서 LLM을 호출하지 마라.**
+
+   맵은 **별도 테이블이 아니라 `transactions`에서 파생한다.** 이미 가지고 있는 데이터다:
+   ```sql
+   select distinct on (merchant) merchant, category, category_source
+   from transactions
+   where user_id = $1 and category is not null
+   order by merchant, (category_source = 'user') desc
+   ```
+   `order by`의 두 번째 키가 **사용자가 고친 값을 LLM 값보다 우선**하게 만든다. 이 한 쿼리가 "2회차부터 새 가맹점만 분류"와 "수정이 다음 달에도 유지"를 둘 다 해결한다.
+
 5. 맵에 없는 가맹점 수를 `unknownMerchantCount`로 반환하고 종료한다.
 
 이 단계는 LLM을 타지 않으므로 2초 안에 끝난다. 사용자는 여기서 이미 거래 목록을 본다.
@@ -55,27 +65,25 @@ export async function ingestStatement(args: {
 ```ts
 export async function classifyStatement(args: {
   userId: string;
-  statementId: string;          // 소유권 확인과 인사이트 캐시 키에만 쓴다
+  statementId: string;          // 소유권 확인용
   db: SupabaseClient;
   classify?: typeof classifyMerchants;   // 테스트에서 갈아끼운다
   makeInsights?: typeof generateInsights;
-}): Promise<{ classifiedCount: number; recurringCount: number; insightsGenerated: boolean }>;
+}): Promise<{ classifiedCount: number; insightsGenerated: boolean }>;
 ```
 
-**이 함수는 명세서 단위가 아니라 사용자 단위로 동작한다.** 미분류 거래는 여러 명세서에 걸쳐 있을 수 있고, 반복 결제 탐지는 누적 전체를 봐야 한다. `statementId`는 소유권 확인과 인사이트 캐시 키에만 쓴다. 이 점을 함수 주석에 적어라 — 이름만 보면 명세서 하나만 처리하는 것처럼 읽힌다.
+**이 함수는 명세서 단위가 아니라 사용자 단위로 동작한다.** 미분류 거래는 여러 명세서에 걸쳐 있을 수 있다. `statementId`는 소유권 확인에만 쓴다. 이 점을 함수 주석에 적어라 — 이름만 보면 명세서 하나만 처리하는 것처럼 읽힌다.
 
 순서:
 1. 이 사용자의 거래 중 **`category`가 null이고 `is_transfer = false`인 것의 유니크 `merchant` 목록**을 조회
    - **이체 행은 반드시 제외한다 (CRITICAL, 개인정보).** 적요에 제3자의 실명이 들어 있어 외부 API로 보내면 안 된다. 이체 행은 LLM 없이 `기타`로 채운다.
-2. 그중 `merchant_categories`에 없는 것만 `classifyMerchants()`에 넘긴다. **목록이 비면 LLM을 호출하지 마라.**
-3. 결과를 `merchant_categories`에 UPSERT (`onConflict: "user_id,merchant"`, `source: "llm"`) — **`source: "user"`인 행은 덮어쓰지 마라.**
-4. 맵을 근거로 `transactions.category`를 UPDATE. 여기서도 `category_source: "user"`인 거래는 건드리지 마라.
-5. 이 사용자의 **전체 거래**(보관 기간 필터 없이)로 `detectRecurring()` → `recurring_charges` UPSERT (`onConflict: "user_id,merchant"`)
-   - 반복 결제 탐지는 명세서 한 건이 아니라 누적 전체를 봐야 의미가 있고, 3회 누적이 조건이라 90일 컷오프를 먼저 걸면 거의 잡히지 않는다(step 5 참조).
-6. **plan이 `pro`이고 `insights`에 해당 `cache_key`가 없으면 `generateInsights()`를 호출해 저장한다.**
-   - 캐시 키는 step 6의 `insightCacheKey(statementId, txnCount)`. `insights` 테이블에 `onConflict: "user_id,cache_key"`로 UPSERT.
-   - **인사이트 생성은 여기가 유일한 자리다.** 대시보드 렌더에서 LLM을 부르지 마라 — 페이지 응답이 20~30초 막힌다. 업로드를 2단계로 나눈 것과 같은 이유다(ADR-008, ADR-011).
-   - 이 호출이 실패해도 1~5단계 결과는 유지하고 `insightsGenerated: false`로 반환한다.
+2. 1단계와 같은 파생 맵 쿼리로 이미 아는 가맹점을 걸러내고, **남은 것만** `classifyMerchants()`에 넘긴다. **목록이 비면 LLM을 호출하지 마라.**
+3. 결과로 `transactions.category`를 UPDATE (`category_source: "llm"`). **`category_source: "user"`인 거래는 건드리지 마라.**
+   - 분류 결과를 따로 저장할 곳은 없다. `transactions.category`가 곧 맵이다.
+4. **plan이 `pro`면 `generateInsights()`를 호출해 `insights`에 UPSERT** (`onConflict: "user_id"`, 사용자당 한 행).
+   - 입력은 방금 갱신된 거래로 계산한 집계 결과다. `detectRecurring`·`detectAnomalies`도 여기서 계산해 넘기되 **결과를 DB에 저장하지 마라** — 대시보드가 조회 시점에 같은 함수로 다시 계산한다. 순수 함수라 재계산 비용이 없고, 저장하면 거래를 지울 때마다 맞춰줘야 하는 사본이 하나 더 생긴다.
+   - **인사이트 생성은 여기가 유일한 자리다.** 대시보드 렌더에서 LLM을 부르지 마라 — 페이지 응답이 20~30초 막힌다(ADR-008, ADR-011).
+   - 이 호출이 실패해도 1~3단계 결과는 유지하고 `insightsGenerated: false`로 반환한다.
 
 **멱등이어야 한다.** 같은 명세서에 두 번 호출해도 결과가 같아야 사용자가 "다시 분류하기"를 눌러도 안전하다.
 
@@ -110,7 +118,7 @@ export async function classifyStatement(args: {
 - 세션 검증, 소유권은 RLS가 보장하지만 응답 코드를 위해 명시적으로도 확인한다
 - `category_source: "user"`로 저장 — 이후 LLM 재분류가 덮어쓰지 못한다
 - 유효하지 않은 카테고리면 `400` + `"올바르지 않은 카테고리입니다."`
-- **`applyToMerchant`가 true면(기본값) 같은 `merchant`의 모든 거래에 반영하고 `merchant_categories`에 `source: "user"`로 UPSERT 한다** (DE-06).
+- **`applyToMerchant`가 true면(기본값) 같은 `merchant`의 모든 거래를 `category_source: "user"`로 함께 UPDATE 한다** (DE-06). 이렇게 하면 다음 달 업로드에서 파생 맵이 자동으로 이 값을 물려받는다 — 따로 저장할 곳이 필요 없다.
   이유: 한 건만 고치면 같은 가맹점 수십 건이 그대로 남아 사용자가 같은 수정을 반복하게 되고, 다음 달에 또 틀린다. 응답에 반영된 건수를 실어 보내라 — 화면에서 `"스타벅스 42건을 식비로 바꿨습니다."`를 보여줄 수 있어야 한다.
 
 ### 6. `src/app/api/statements/[id]/route.ts` (**`route.test.ts` 먼저**)
@@ -120,8 +128,8 @@ export async function classifyStatement(args: {
 엉뚱한 파일을 올렸을 때 되돌릴 방법이 지금 없다. 카테고리 수정으로도, 재업로드로도 안 되고 유일한 탈출구가 계정 삭제다. `transactions`가 `on delete cascade`라 실제 코드는 짧다.
 
 - 세션 검증 + 소유권 확인(RLS가 막지만 404를 주기 위해 명시적으로도)
-- 삭제 후 `detectRecurring`을 다시 돌려 `recurring_charges`를 갱신한다 — 남은 거래 기준으로 다시 계산해야 한다
 - 응답에 삭제된 거래 수를 실어 `"명세서와 거래 234건을 삭제했습니다."`를 보여줄 수 있게 한다
+- 삭제 후 추가 정리 작업은 **없다.** 반복 결제·이상 거래·가맹점 맵이 전부 `transactions`에서 조회 시점에 파생되므로 자동으로 맞는다. 파생값을 저장하지 않기로 한 설계의 이득이다.
 
 ### 7. `src/app/api/export/route.ts` (**`route.test.ts` 먼저**)
 
@@ -145,31 +153,29 @@ function csvCell(v: string): string {
 
 ### 8. 업로드 제한
 
-**횟수 제한을 만들지 마라** (ADR-006). Free/Pro 모두 업로드 무제한이다. 플랜은 조회 범위와 기능으로만 갈린다.
+**횟수 제한도, 레이트 리밋도 만들지 마라** (ADR-006). Free/Pro 모두 업로드 무제한이고, 플랜은 조회 범위와 기능으로만 갈린다.
 
-단, **남용 방지 상한은 별개다.** 분류 엔드포인트는 호출할 때마다 LLM 비용이 나가므로 사용자당 **시간당 20회** 상한을 둔다. 정상 사용은 월 1~4회라 실사용자는 절대 닿지 않는 선이고, ADR-006의 "제품 쿼터를 두지 않는다"와 충돌하지 않는다. 초과 시 `429` + `"요청이 너무 많습니다. 잠시 후 다시 시도해주세요."`
-
-상한 카운터는 별도 테이블 없이 `statements`/`insights`의 최근 `created_at` 개수로 판정한다.
+남용 방지 상한은 **공개 배포 전 과제**로 미룬다. 지금은 사용자가 몇 명뿐이고, LLM 비용의 실질 상한은 Anthropic 콘솔의 지출 한도가 잡아준다. 카운팅 쿼리와 임계값 튜닝을 지금 넣으면 정상 사용자를 잠글 위험만 생긴다. `docs/SECURITY.md`에 "공개 전 추가할 것"으로 한 줄 남긴다.
 
 ### 테스트에 반드시 포함할 케이스
 
 - 미인증 요청 → 401
 - 같은 CSV를 두 번 ingest → 두 번째는 `insertedCount: 0`, `duplicateCount`가 행 수와 같음
 - **`ingestStatement`가 LLM을 전혀 호출하지 않는지** (1단계는 LLM 없이 끝나야 한다)
-- **맵에 이미 있는 가맹점은 1단계에서 분류가 채워지고 `unknownMerchantCount`에 세지 않는지**
+- **과거 거래에서 파생한 맵으로 1단계에서 분류가 채워지고 `unknownMerchantCount`에 세지 않는지**
+- **파생 맵이 `category_source: "user"` 값을 `"llm"` 값보다 우선하는지**
 - `category_source: "user"`인 거래가 재분류에서 제외되는지
 - 미분류 가맹점이 0개면 `classifyMerchants`가 호출되지 않는지
 - **`classifyStatement`를 두 번 호출해도 결과가 같은지** (멱등성)
 - **분류가 실패해도 이미 저장된 거래가 남아 있는지** (롤백하지 않음)
-- **인사이트 캐시가 있으면 `generateInsights`가 호출되지 않는지**
 - **인사이트 생성이 실패해도 분류·반복결제 결과가 유지되고 `insightsGenerated: false`가 반환되는지**
 - **plan이 `free`면 `generateInsights`가 호출되지 않는지**
 - **`isTransfer: true`인 거래의 `merchant`가 `classifyMerchants`에 넘어가지 않는지** (개인정보 — 반드시 단언하라)
 - **5만 행 입력이 1,000행 단위로 나뉘어 전송되는지** (호출 횟수 단언)
 - **내보내기: `=cmd`로 시작하는 가맹점명이 `'=cmd`로 이스케이프되는지**
 - **내보내기: Free 플랜은 403인지**
-- **명세서 삭제: 남의 `statementId`는 404, 삭제 후 `recurring_charges`가 재계산되는지**
-- **`applyToMerchant: true`로 수정하면 같은 가맹점 전체가 바뀌고 `merchant_categories`에 `source: "user"`로 남는지**
+- **명세서 삭제: 남의 `statementId`는 404, 거래가 함께 사라지는지**
+- **`applyToMerchant: true`로 수정하면 같은 가맹점 전체가 `category_source: "user"`로 바뀌는지**
 - 파서가 던진 한국어 에러가 400 응답 본문에 그대로 실리는지
 - 예상치 못한 예외의 원문이 응답에 **노출되지 않는지**
 
@@ -205,7 +211,8 @@ npm run test
 - 사용자가 수정한 카테고리를 LLM 결과로 덮어쓰지 마라. 이유: 사용자 입력이 항상 우선이다.
 - **파싱·저장과 LLM 분류를 한 요청에 묶지 마라.** 이유: 분류가 실패하면 파싱 결과까지 잃고, 사용자는 30초를 기다린 끝에 아무것도 얻지 못한 채 처음부터 다시 해야 한다(ADR-008).
 - **분류 실패 시 이미 저장한 거래를 롤백하지 마라.** 이유: 미분류 상태로 남기고 재시도하게 두는 것이 이 설계의 목적이다.
-- **이미 아는 가맹점을 LLM에 다시 묻지 마라.** 이유: 명세서는 매달 온다. `merchant_categories`를 먼저 조회하지 않으면 같은 질문에 매달 돈을 낸다(ADR-009).
+- **이미 아는 가맹점을 LLM에 다시 묻지 마라.** 이유: 명세서는 매달 온다. 과거 거래에서 파생한 맵을 먼저 보지 않으면 같은 질문에 매달 돈을 낸다(ADR-009).
+- **파생 가능한 값을 저장하는 테이블을 새로 만들지 마라.** 이유: 반복 결제·가맹점 맵은 `transactions`에서 계산되는 값이다. 저장하면 원본과 어긋날 수 있는 사본이 생기고, 거래를 지울 때마다 맞춰줘야 한다.
 - **이체 행의 `merchant`를 LLM에 보내지 마라.** 이유: 제3자의 실명이다. 우리가 공지한 "가맹점명 전송"의 범위를 넘는다.
 - 5만 행을 한 번에 upsert 하지 마라. 이유: 요청 바디 한도를 넘어 자기 사양의 상한에서 죽는다.
 - 내보내기 CSV 셀을 이스케이프 없이 쓰지 마라. 이유: `=`로 시작하는 가맹점명이 엑셀에서 수식으로 실행된다.

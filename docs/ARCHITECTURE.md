@@ -23,9 +23,9 @@ supabase/migrations/        # SQL 마이그레이션 (테이블 + RLS)
 | `subscriptions` | Polar 구독 상태 미러 | `user_id`, `polar_subscription_id`, `status`, `current_period_end` |
 | `statements` | 업로드 1건 = 1 row | `user_id`, `filename`, `source_hint`, `period_start`, `period_end`, `row_count` |
 | `transactions` | **개별 거래 원본** | `user_id`, `statement_id`, `txn_date`, `description`, `merchant`, `amount`, `category`, `category_source`, `raw` (jsonb 원본 행) |
-| `merchant_categories` | 사용자별 가맹점→카테고리 맵 | `user_id`, `merchant`, `category`, `source`(`llm`\|`user`), unique `(user_id, merchant)` |
-| `recurring_charges` | 탐지된 반복 결제 | `user_id`, `merchant`, `median_amount`, `interval_days`, `last_seen_at`, `status`(`active`\|`dormant`) |
-| `insights` | LLM 생성 요약/제안 | `user_id`, `statement_id`, `kind`, `payload`(jsonb), `model`, `cache_key`, unique `(user_id, cache_key)` |
+| `insights` | LLM 생성 요약/제안 | `user_id`, `payload`(jsonb), `model`, unique `(user_id)` — 최신 한 벌만 |
+
+**테이블은 이 5개가 전부다.** 반복 결제, 가맹점→카테고리 맵, 카테고리별 합계는 전부 `transactions`에서 계산되는 **파생값이라 저장하지 않는다**(ADR-013). 저장하면 원본과 어긋날 수 있는 사본이 생기고, 거래를 지울 때마다 재계산해 맞춰줘야 한다. LLM 결과(`insights`)만 예외인데, 그건 계산이 아니라 돈과 시간이 드는 외부 호출의 산물이기 때문이다.
 
 거래는 **원본 그대로 보관한다.** 명세서를 누적할수록 기간별 추이와 반복 결제 탐지가 정확해지기 때문이다. `transactions.raw`에 원본 CSV 행을 jsonb로 남겨 컬럼 매핑이 틀렸을 때 재처리할 수 있게 한다.
 
@@ -33,11 +33,16 @@ supabase/migrations/        # SQL 마이그레이션 (테이블 + RLS)
 
 중복 방지: `(txn_date, amount, description, occurrence)` 해시를 `fingerprint`로 두고 `unique (user_id, fingerprint)`를 건다. `occurrence`는 **한 파일 안에서 동일 조합이 몇 번째로 등장했는지**다. 이게 없으면 같은 날 같은 가게에서 같은 금액을 두 번 결제한 정상 거래가 중복으로 지워지고, 그 데이터를 근거로 하는 `duplicate_suspect` 이상 탐지가 영원히 발동하지 않는다.
 
-카테고리의 진실 위치가 둘로 보이지만 서로 다른 사실을 기록한다:
-- `merchant_categories.source` — 이 **가맹점**의 기본 카테고리를 누가 정했는가
-- `transactions.category_source` — 이 **거래 하나**를 사용자가 따로 지정했는가. `'user'`면 맵 갱신이 절대 덮어쓰지 않는다
+가맹점→카테고리 맵은 **테이블이 아니라 쿼리다.** 이미 분류된 거래에서 뽑아낸다:
 
-`transactions.category`는 맵에서 파생된 값을 물리적으로 들고 있는 캐시다. 집계 쿼리가 조인 없이 돌게 하기 위해서다.
+```sql
+select distinct on (merchant) merchant, category
+from transactions
+where user_id = $1 and category is not null
+order by merchant, (category_source = 'user') desc
+```
+
+`category_source = 'user'`를 우선하므로 사용자가 고친 값이 LLM 값을 이긴다. 이 한 쿼리가 "2회차부터 새 가맹점만 LLM에 묻기"와 "수정이 다음 달에도 유지"를 둘 다 해결한다.
 
 ## 분석 파이프라인 — 무엇을 코드로, 무엇을 LLM으로
 
@@ -63,19 +68,18 @@ LLM 호출은 두 번뿐이고 **둘 다 업로드 2단계에서만 일어난다
   → Supabase 세션 검증
   → lib/csv: 인코딩 감지 → 헤더 매핑 → 마스킹 → Transaction[]
   → statements + transactions INSERT (지문으로 중복 스킵)
-  → merchant_categories에 이미 있는 가맹점은 즉시 category 채움 (LLM 없이)
+  → 파생 맵(위 쿼리)에 있는 가맹점은 즉시 category 채움 (LLM 없이)
   → { statementId, insertedCount, duplicateCount, skippedRows,
       unknownMerchantCount } 응답 → 사용자는 여기서 이미 거래 목록을 본다
 
 2단계  POST /api/statements/[id]/classify          (10~30초, 실패해도 1단계는 남는다)
-  → merchant_categories에 없는 merchant만 추출
+  → 파생 맵에 없는 merchant만 추출 (이체 행 제외 — 실명이 들어간다)
   → services/anthropic.classifyMerchants() ─ LLM 호출 ①
-  → merchant_categories UPSERT + transactions.category UPDATE
-  → lib/recurring: 누적 전체로 반복 결제 탐지 → recurring_charges UPSERT
-  → plan이 pro이고 캐시가 없으면:
+  → transactions.category UPDATE (category_source='llm')
+  → plan이 pro면:
       services/anthropic.generateInsights(집계결과) ─ LLM 호출 ②
-      → insights UPSERT (onConflict: user_id,cache_key)
-  → { classifiedCount, recurringCount, insightsGenerated } 응답
+      → insights UPSERT (onConflict: user_id)
+  → { classifiedCount, insightsGenerated } 응답
 
 [대시보드 조회]  ── LLM을 부르지 않는다 (ADR-011)
 /dashboard (Server Component)

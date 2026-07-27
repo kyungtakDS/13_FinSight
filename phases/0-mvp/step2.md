@@ -50,7 +50,7 @@ export function parseStatementCsv(buffer: ArrayBuffer, filename: string): ParseR
 - 날짜: `2026.07.27`, `2026/07/27`, `26.07.27`, `20260727` 등을 `2026-07-27`로. 파싱 불가 행은 `skippedRows`에 넣고 계속 진행한다.
 - 금액: `₩`, `,`, 공백, `원` 제거. 괄호 표기(`(1,234)`)는 음수로 해석. **지출이 양수**가 되도록 부호를 맞춘다 — 출금/승인 컬럼은 양수, 입금/환불 컬럼은 음수.
 - `merchant`: `description`에서 정규화. 뒤에 붙는 지점/일련번호(`스타벅스 강남2호점` → `스타벅스`), 앞의 카드사 접두어, `(주)`·`주식회사` 제거. 원본은 `description`에 그대로 남긴다.
-  **이 정규화를 `export function normalizeMerchant(description: string): string` 로 따로 빼라.** 가맹점명이 `merchant_categories` 테이블의 키가 되므로(ADR-009), 파싱과 조회가 반드시 같은 문자열을 만들어야 한다. 규칙이 두 곳에 복사되면 같은 가게가 두 항목으로 갈린다.
+  **이 정규화를 `export function normalizeMerchant(description: string): string` 로 따로 빼라.** 가맹점명이 카테고리 맵의 키가 되므로(ADR-009), 파싱과 조회가 반드시 같은 문자열을 만들어야 한다. 규칙이 두 곳에 복사되면 같은 가게가 두 항목으로 갈린다.
 
 **4. 마스킹 (CRITICAL).** 저장 전에 민감 식별자를 마스킹한다. `src/lib/mask.ts`로 분리하고 `mask.test.ts`를 먼저 쓴다.
 

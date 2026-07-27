@@ -14,7 +14,9 @@ SQL 마이그레이션과 Supabase 클라이언트 헬퍼를 만든다. **이 st
 
 ### 1. `supabase/migrations/0001_init.sql`
 
-`docs/ARCHITECTURE.md`의 데이터 모델 표대로 **7개** 테이블을 만든다: `profiles`, `subscriptions`, `statements`, `transactions`, `merchant_categories`, `recurring_charges`, `insights`.
+`docs/ARCHITECTURE.md`의 데이터 모델 표대로 **5개** 테이블을 만든다: `profiles`, `subscriptions`, `statements`, `transactions`, `insights`.
+
+**테이블을 더 만들지 마라.** 반복 결제와 가맹점→카테고리 맵은 둘 다 `transactions`에서 파생되는 값이라 별도 테이블이 필요 없다. 저장하면 원본과 어긋날 수 있는 사본이 하나 더 생기고, 거래를 지울 때마다 재계산해 맞춰줘야 한다. 파생값은 조회 시점에 계산한다.
 
 요구사항:
 
@@ -23,22 +25,20 @@ SQL 마이그레이션과 Supabase 클라이언트 헬퍼를 만든다. **이 st
 - 그 외 모든 테이블에 `user_id uuid not null references auth.users(id) on delete cascade`
 - `transactions`: `statement_id uuid not null references statements(id) on delete cascade`, `txn_date date not null`, `description text not null`, `merchant text not null`, **`amount numeric(14,0) not null`**, `category text`, `category_source text check (category_source in ('llm','user'))`, `raw jsonb not null`, `fingerprint text not null`
   - **소수점 자리를 두지 마라.** 원화에 소수점이 없고, `docs/ADR.md`와 step 5가 "정수 원 단위로 다룬다"를 전제한다. `numeric(14,2)`로 두면 반올림 오차가 들어올 자리를 만드는 셈이다.
-  - **`category_source`의 의미를 정확히 지켜라:** `'user'`는 *이 거래 하나*를 사용자가 직접 지정했다는 뜻이고, 가맹점 맵 갱신이 **절대 덮어써서는 안 되는 표시**다. `'llm'`은 맵에서 파생된 값이라 재분류로 갱신해도 된다. 맵(`merchant_categories.source`)은 가맹점의 기본값을, 이 컬럼은 거래 단위 예외를 기록한다 — 둘은 다른 사실이다.
+  - **`category_source`의 의미를 정확히 지켜라:** `'user'`는 사용자가 직접 지정했다는 뜻이고 **재분류가 절대 덮어써서는 안 되는 표시**다. `'llm'`은 자동 분류된 값이라 갱신해도 된다. 가맹점→카테고리 맵도 이 컬럼으로 파생한다(step 7).
 - **`unique (user_id, fingerprint)`** — 같은 명세서를 두 번 올려도 중복되지 않게
-- 인덱스: `transactions(user_id, txn_date desc)`, `transactions(user_id, category)`, **`transactions(user_id, merchant)`**, `recurring_charges(user_id, status)`
-  - `(user_id, merchant)`는 step 7의 두 쿼리가 매번 쓴다 — 미분류 가맹점 스캔과 가맹점 단위 카테고리 일괄 수정.
-- `merchant_categories`: `merchant text not null`, `category text not null`, `source text not null check (source in ('llm','user'))`, `updated_at timestamptz not null default now()`, **`unique (user_id, merchant)`**. 사용자별 가맹점→카테고리 맵이다(ADR-009). 이게 있어야 2회차 업로드에서 같은 가맹점을 LLM에 다시 묻지 않고, 사용자의 수정이 다음 달에도 유지된다.
-- `recurring_charges`: `merchant text not null`, `median_amount numeric(14,0)`, `interval_days int`, `occurrences int`, `first_seen_at date`, `last_seen_at date`, `status text check (status in ('active','dormant'))`, `unique (user_id, merchant)`
-- `insights`: `statement_id uuid references statements(id) on delete cascade`, `kind text not null`, `payload jsonb not null`, `model text not null`, **`cache_key text not null`**, **`unique (user_id, cache_key)`**
-  - step 6이 `insightCacheKey()`를 만드는데 1차 설계에는 그 값을 담을 컬럼도, UPSERT를 가능하게 할 유니크 키도 없었다. 캐시를 강제할 수단이 없으면 대시보드를 열 때마다 LLM을 다시 부른다.
+- 인덱스: `transactions(user_id, txn_date desc)`, `transactions(user_id, category)`, **`transactions(user_id, merchant)`**
+  - `(user_id, merchant)`는 step 7이 매번 쓴다 — 가맹점→카테고리 맵 조회와 가맹점 단위 일괄 수정.
+- `insights`: `payload jsonb not null`, `model text not null`, **`unique (user_id)`** — 사용자당 한 행. 새로 생성하면 덮어쓴다.
+  - 인사이트를 명세서별로 쌓아두지 마라. **최신 한 벌이면 충분하다** — 지난달 인사이트를 다시 볼 화면이 없고, 한 행으로 두면 캐시 키와 무효화 규칙이 통째로 사라진다. 업로드할 때마다 덮어써지므로 낡을 일도 없다.
 - `subscriptions`: `polar_subscription_id text unique`, `status text not null`, `current_period_end timestamptz`, `unique (user_id)`
 
 ### 2. `supabase/migrations/0002_rls.sql`
 
 **CRITICAL — 모든 테이블에 RLS를 켜고 정책을 붙인다.** 정책 없는 테이블이 하나라도 남으면 이 step은 실패다.
 
-- `alter table <t> enable row level security;` × 7
-- 데이터 테이블(`statements`, `transactions`, `merchant_categories`, `recurring_charges`, `insights`)에 select / insert / update / delete 정책. 조건은 `auth.uid() = user_id`.
+- `alter table <t> enable row level security;` × 5
+- 데이터 테이블(`statements`, `transactions`, `insights`)에 select / insert / update / delete 정책. 조건은 `auth.uid() = user_id`.
 - **`profiles`와 `subscriptions`에는 사용자 UPDATE / INSERT / DELETE 정책을 만들지 마라. select만 허용한다** (`profiles`는 `auth.uid() = id`). 쓰기는 웹훅과 트리거가 service role로만 한다.
 
   **이유 (권한 상승 취약점, ADR-012):** RLS는 **행 단위** 정책이다. `profiles`에 `for update using (auth.uid() = id)`를 붙이면 그 행의 **모든 컬럼**이 열린다. 즉 브라우저에서 이 한 줄로 결제가 우회된다:
@@ -91,14 +91,14 @@ export function retentionCutoff(plan: Plan, now?: Date): Date | null;  // free �
 npm run lint
 npm run build
 npm run test
-grep -c "enable row level security" supabase/migrations/0002_rls.sql   # 7 이상이어야 한다
+grep -c "enable row level security" supabase/migrations/0002_rls.sql   # 5 이상이어야 한다
 ```
 
 ## 검증 절차
 
-1. 위 AC 커맨드를 실행한다. `grep` 결과가 7 미만이면 실패로 간주하고 정책을 보완하라.
+1. 위 AC 커맨드를 실행한다. `grep` 결과가 5 미만이면 실패로 간주하고 정책을 보완하라.
 2. 아키텍처 체크리스트:
-   - 7개 테이블 전부 RLS가 켜져 있고 정책이 있는가?
+   - 5개 테이블 전부 RLS가 켜져 있고 정책이 있는가?
    - **`profiles`와 `subscriptions`에 사용자 UPDATE 정책이 없는가?** (`grep -n "on profiles" supabase/migrations/0002_rls.sql` 로 확인 — `for update`가 나오면 안 된다)
    - `transactions`에 `unique (user_id, fingerprint)`가 있는가?
    - `admin.ts`에 `import "server-only"`가 있는가?

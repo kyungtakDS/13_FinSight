@@ -39,7 +39,7 @@ npm run dev
 1. 프로젝트 생성
 2. `supabase/migrations/` 의 SQL을 순서대로 실행 (`0001` → `0002` → `0003`). SQL Editor 붙여넣기 또는 `supabase db push`.
 3. Authentication → Email 공급자 활성화, `Site URL`과 `Redirect URLs`에 `/auth/callback` 등록
-4. **RLS 확인:** Table Editor에서 7개 테이블 모두 RLS가 켜져 있는지 눈으로 확인. 꺼져 있으면 배포하지 마라.
+4. **RLS 확인:** Table Editor에서 5개 테이블 모두 RLS가 켜져 있는지 눈으로 확인. 꺼져 있으면 배포하지 마라.
 5. Authentication → Email Templates에서 **비밀번호 재설정 메일**이 활성화돼 있는지 확인. `Redirect URLs`에 `/auth/reset/confirm`도 등록한다.
 
 **Polar 설정 절차**
@@ -108,6 +108,7 @@ npm run dev
 - 외부 전송: 가맹점명(유니크 목록)과 집계 결과가 Anthropic Claude API로 전송됨. 개별 거래 원문은 전송하지 않음. 이미 분류된 가맹점은 다시 전송하지 않음. **계좌이체 거래는 적요에 실명이 들어가므로 전송 대상에서 제외됨.**
 - 격리: 모든 테이블 RLS. **플랜·구독 컬럼은 사용자 쓰기 불가** — 웹훅이 service role로만 갱신
 - 삭제: 설정 화면의 계정 삭제로 사용자가 직접 전 데이터를 지울 수 있음. 명세서 단위 삭제도 가능
+- **공개 전 추가할 것**: 업로드·분류 엔드포인트 레이트 리밋. MVP 단계에서는 Anthropic 콘솔의 지출 한도로 갈음한다
 
 랜딩의 개인정보 문단도 이 범위와 일치시켜라. "가맹점명이 전송됩니다"만 쓰면 사용자는 그것을 "내가 송금한 사람 이름"으로 읽지 않는다 — 이체 행을 제외한다는 사실을 함께 적는다.
 

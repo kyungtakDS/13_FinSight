@@ -29,15 +29,15 @@ PRD의 분석 4종을 대시보드에 렌더한다. 차트 라이브러리는 `r
    - **캐시가 있어도 "다시 생성" 버튼을 함께 둔다.** 캐시 키가 `(statementId, txnCount)`라 카테고리를 고쳐도 건수는 그대로다 — 사용자가 분류를 대거 수정한 뒤에도 낡은 인사이트가 영구히 남는다. 수동 갱신 경로가 필요하다.
 7. 결과를 컴포넌트에 props로 내린다
 
-**조회 쿼리 자체에 보관 기간 필터를 건다.** 전부 가져와서 TS에서 거르지 마라 — Free 사용자에게 몇 년치 행을 Postgres에서 끌어온 뒤 버리는 셈이다.
+**거래는 한 번만 조회한다.**
 
 ```ts
-const cutoff = retentionCutoff(plan);
-let q = db.from("transactions").select("*").order("txn_date", { ascending: false });
-if (cutoff) q = q.gte("txn_date", toDateString(cutoff));
+const all = await db.from("transactions").select("*").order("txn_date", { ascending: false });
+const visible = applyRetention(all, plan);   // 표시용
+// 탐지에는 all 을 그대로 넘긴다
 ```
 
-`applyRetention`(step 5)은 순수 함수 테스트용이고, 실제 조회 경로에서는 이 SQL 필터가 사용된다. 단, 5번의 탐지 함수에 넘길 거래는 **필터 없이** 따로 조회한다.
+같은 규칙을 SQL 필터와 TS 함수로 두 벌 구현하지 마라. 탐지에는 어차피 전체 이력이 필요하므로(ADR-010 따름정리) 필터링된 쿼리를 따로 날리면 조회가 두 번이 된다. 보관 기간이 조회량을 제한하는 효과는 Pro에는 없고, Free의 3개월치는 애초에 작다. 한 번 가져와 `applyRetention`으로 나누는 쪽이 짧고 테스트도 이미 있다.
 
 `useEffect` + `fetch`로 초기 데이터를 받지 마라 (CLAUDE.md 규칙).
 
@@ -58,7 +58,7 @@ if (cutoff) q = q.gte("txn_date", toDateString(cutoff));
 - 표 보기 토글 제공
 
 **3. `src/components/dashboard/TrendChart.tsx`**
-월별 총지출 선 그래프 + 카테고리별 누적 영역 토글.
+월별 총지출 선 그래프. **주별 토글을 만들지 마라** — step 5가 월별만 계산한다.
 - 선 2px, 마커 8px 이상
 - **크로스헤어 + 툴팁 필수**
 - **y축은 하나만.** 이중 축을 만들지 마라.
@@ -159,7 +159,8 @@ npm run test
    - **히어로 숫자가 "이번 달"이 아니라 최근 명세서 기간 기준인가?**
    - **구독·이상 거래 요약 수치가 Free에도 표시되는가?** (계산까지 잠그면 안 된다)
    - **`page.tsx`와 컴포넌트 어디에도 `generateInsights` 호출이 없는가?** (`grep -rn "generateInsights" src/app src/components` → 0건이어야 한다)
-   - **보관 기간 필터가 SQL 쿼리(`.gte("txn_date", …)`)에 걸려 있는가?** (전량 조회 후 TS 필터 금지)
+   - **거래 조회가 한 번인가?** (표시용/탐지용으로 두 번 쿼리하지 않았는가)
+   - **파생값을 저장하는 코드가 없는가?** (반복 결제·이상 거래는 계산만 하고 DB에 쓰지 않는다 — ADR-013)
    - 미분류 배너와 다시 분류하기 버튼이 있는가?
    - 초기 데이터를 `useEffect`+`fetch`로 받지 않는가?
    - UI 문자열이 전부 한국어인가?
@@ -177,7 +178,7 @@ npm run test
 - 성공 경로만 렌더하지 마라. 이유: 빈 상태·부분 상태·실패 상태가 실제 사용에서 훨씬 자주 나온다. 매트릭스의 모든 칸이 이 step의 요구사항이다.
 - 결제 반영이 늦은 것을 결제 실패로 표시하지 마라. 이유: 돈은 이미 나갔고, 사용자는 사기당했다고 느낀다.
 - **Server Component 렌더 안에서 LLM을 호출하지 마라.** 이유: 페이지 응답이 20~30초 막힌다. 대시보드는 `insights` 캐시를 읽기만 하고, 생성은 step 7의 2단계가 한다(ADR-011).
-- 거래를 전량 조회한 뒤 TS에서 보관 기간을 거르지 마라. 이유: Free 사용자에게 몇 년치 행을 끌어온 뒤 버리는 셈이다. 필터는 쿼리에 건다.
+- 같은 보관 기간 규칙을 SQL과 TS 두 곳에 구현하지 마라. 이유: 두 벌이 되면 곧 갈라진다. 한 번 조회하고 `applyRetention`으로 나눈다.
 - `UI_GUIDE.md` 안티패턴 표의 항목을 쓰지 마라 (glass morphism, 그라데이션 텍스트, "Powered by AI" 배지, 글로우 애니메이션, 보라색 브랜딩, gradient orb).
 - 모든 데이터 포인트에 숫자 라벨을 찍지 마라. 이유: 차트가 표가 되어버린다. 표가 필요하면 표 보기 토글을 쓴다.
 - 기존 테스트를 깨뜨리지 마라.

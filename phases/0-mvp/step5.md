@@ -26,8 +26,10 @@ export function categoryBreakdown(txns: Transaction[]): CategoryBreakdown[];
 ### 2. `src/lib/analytics/trend.ts`
 
 ```ts
-export function periodTrend(txns: Transaction[], granularity: "month" | "week"): PeriodPoint[];
+export function periodTrend(txns: Transaction[]): PeriodPoint[];   // 월별만
 ```
+
+**주별 집계를 만들지 마라.** 명세서는 월 1회 나오고 요금제·보관 기간·히어로 숫자가 전부 월 단위다. 주별 뷰는 아무도 요청하지 않았고, 파라미터 하나가 늘면 테스트·차트 토글·`PeriodPoint.period` 포맷 분기가 함께 따라온다.
 
 기간별 총지출과 카테고리별 내역. **거래가 없는 중간 기간도 `total: 0`으로 채운다** — 차트에 구멍이 생기면 추이가 왜곡된다. 기간 오름차순 정렬.
 
@@ -68,11 +70,15 @@ export function detectAnomalies(txns: Transaction[]): AnomalyFlag[];
 
 **통계 기반. LLM을 쓰지 마라.**
 
-- `amount_outlier`: 같은 카테고리 내에서 **MAD(중앙값 절대편차)** 기준 수정 z-score `|z| > 3.5`. 표본이 5건 미만인 카테고리는 건너뛴다. MAD가 0이면 건너뛴다(0으로 나누기 방지).
-- `new_merchant_high_amount`: 처음 등장한 `merchant`이면서 금액이 전체 지출 상위 5% 이상
-- `duplicate_suspect`: 같은 `merchant`·같은 금액이 **24시간 이내** 2건 이상
-- `severity`: 수정 z-score `> 5` 또는 duplicate는 `"critical"`, 나머지 `"warning"`
+**MVP에서는 판정 규칙을 하나만 만든다.**
+
+- `amount_outlier`: 같은 카테고리 내에서 **MAD(중앙값 절대편차)** 기준 수정 z-score `|z| > 3.5`. 표본이 5건 미만인 카테고리는 건너뛴다. MAD가 0이면 건너뛴다(0으로 나누기 방지). 중앙값이 0이어도 건너뛴다.
+- `severity`: 수정 z-score `> 5`면 `"critical"`, 나머지 `"warning"`
 - `detail`은 **한국어**이고 숫자를 포함해야 한다. 예: `"이 카테고리 평소 결제액(중앙값 ₩23,000)의 8배입니다."`
+
+`new_merchant_high_amount`(상위 5%)와 `duplicate_suspect`(24시간 내 동일 금액)는 **넣지 마라.** 둘 다 임계값이 임의이고 실제 데이터로 검증된 적이 없다. 금융 앱에서 오탐이 쌓이면 사용자는 이 목록 전체를 안 보게 되는데, 지금은 오탐을 지울 수단(무시 처리)도 없다. 규칙 하나를 실제 명세서로 검증한 뒤 늘리는 편이 낫다.
+
+step 1의 `AnomalyFlag.reason`도 `"amount_outlier"` 하나다. 타입과 구현을 어긋나게 두지 마라.
 
 ### 5. `src/lib/analytics/index.ts`
 
@@ -100,7 +106,7 @@ export function applyRetention(txns: Transaction[], plan: Plan, now?: Date): Tra
 - **`periodTrend`: KST 8월 1일 00:30 거래가 `"2026-08"` 버킷에 들어가는지** (프로세스 TZ를 UTC로 고정한 상태에서 단언하라 — `process.env.TZ = "UTC"`)
 - **`applyRetention`: 컷오프 경계일이 KST 기준으로 계산되는지**
 - `detectRecurring`: 월간 구독 6회 → 탐지됨 / 금액이 30% 튀는 건 → 미탐지 / 2회만 → 미탐지 / 마지막 결제가 3개월 전 월간 구독 → `dormant`
-- `detectAnomalies`: MAD가 0인 카테고리에서 예외가 나지 않는지, 표본 5건 미만 스킵
+- `detectAnomalies`: MAD가 0인 카테고리에서 예외가 나지 않는지, 표본 5건 미만 스킵, 중앙값 0에서 나눗셈 예외가 없는지
 - `applyRetention`: free는 90일 이전 제외, pro는 전량 유지
 
 ## Acceptance Criteria
@@ -131,5 +137,7 @@ npm run test
 - 기간 경계를 서버 로컬 시각으로 계산하지 마라. 이유: Vercel은 UTC다. 반드시 KST로 버킷팅한다.
 - 평균(mean)과 표준편차로 이상치를 잡지 마라. 이유: 지출 분포는 꼬리가 길어 평균이 이상치에 끌려간다. MAD를 쓰라고 명시한 이유다.
 - `detectRecurring`·`detectAnomalies`에 보관 기간 필터를 먼저 걸지 마라. 이유: 반복 결제는 3회 누적이 조건이라 90일 컷오프와 정면으로 충돌한다. 필터를 거치면 Free 사용자에게 보여줄 수치가 0이 되고 ADR-010이 무의미해진다.
-- `duplicate_suspect` 판정 대상이 파서 단계에서 이미 제거되지 않았는지 확인하라. 이유: 지문에 `occurrence`가 들어가야 같은 날 같은 금액 거래 2건이 살아남는다(step 2). 안 그러면 이 규칙은 절대 발동하지 않는다.
+- 이상 탐지 규칙을 세 종류로 늘리지 마라. 이유: 임계값이 실제 데이터로 검증된 적 없고, 오탐을 지울 수단(무시 처리)이 아직 없다. 오탐이 쌓이면 목록 전체를 안 보게 된다. `amount_outlier` 하나로 시작한다.
+- 주별 집계를 만들지 마라. 이유: 제품 전체가 월 단위다. 파라미터 하나가 테스트·차트 토글·포맷 분기를 데려온다.
+- 계산 결과를 DB에 저장하려 하지 마라. 이유: 전부 파생값이다(ADR-013). 저장하면 원본이 바뀔 때 맞춰주는 코드가 따라붙는다.
 - 기존 테스트를 깨뜨리지 마라.

@@ -78,11 +78,7 @@ export async function generateInsights(input: {
 
 ### 캐시
 
-```ts
-export function insightCacheKey(statementId: string, txnCount: number): string;
-```
-
-같은 명세서에 대해 거래 수가 변하지 않았으면 재호출하지 않는다. 여기서는 키 생성만 하고, 실제 저장은 **step 7의 2단계**가 `insights.cache_key`(unique `(user_id, cache_key)`)에 UPSERT 한다. **대시보드(step 8)는 이 캐시를 읽기만 하고 `generateInsights`를 부르지 않는다**(ADR-011).
+**캐시 키 함수를 만들지 마라.** 인사이트는 `insights` 테이블에 **사용자당 한 행**(unique `user_id`)으로 저장되고, step 7의 2단계가 업로드할 때마다 덮어쓴다. 호출 시점이 이미 "새 데이터가 들어왔을 때"로 제한돼 있으므로 별도의 무효화 규칙이 필요 없다. **대시보드(step 8)는 이 행을 읽기만 하고 `generateInsights`를 부르지 않는다**(ADR-011).
 
 ### 테스트에 반드시 포함할 케이스
 
